@@ -230,7 +230,7 @@ class LatheApp(ctk.CTk):
                 bus = ModbusBus(
                     port,
                     baudrate=bp.baud,
-                    parity=str(mb.get("parity", "N")),
+                    parity=str(mb.get("parity", "E")),
                     stopbits=int(mb.get("stopbits", 1)),
                     bytesize=int(mb.get("bytesize", 8)),
                     timeout=0.4,

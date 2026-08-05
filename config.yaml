@@ -38,7 +38,7 @@ limits:
   max_chuck_rpm: 300.0
 
 modbus:
-  parity: N
+  parity: E
   stopbits: 1
   bytesize: 8
-  timeout_s: 1.0
+  timeout_s: 0.5

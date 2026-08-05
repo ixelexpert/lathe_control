@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Sequence
 
 import minimalmodbus
@@ -26,11 +27,12 @@ class ModbusBus:
         port: str,
         baudrate: int = 115200,
         *,
-        parity: str = "N",
+        parity: str = "E",
         stopbits: int = 1,
         bytesize: int = 8,
-        timeout: float = 1.0,
+        timeout: float = 0.5,
         handle_local_echo: bool = False,
+        inter_frame_s: float = 0.02,
     ) -> None:
         self.port = port
         self.baudrate = baudrate
@@ -39,6 +41,7 @@ class ModbusBus:
         self.bytesize = bytesize
         self.timeout = timeout
         self.handle_local_echo = handle_local_echo
+        self.inter_frame_s = inter_frame_s
         self._lock = threading.RLock()
         self._connected = False
         # One Instrument; slave address is switched per transaction.
@@ -107,6 +110,7 @@ class ModbusBus:
             instrument.write_register(
                 int(address), value, number_of_decimals=0, functioncode=6, signed=False
             )
+            time.sleep(self.inter_frame_s)
 
     def write_i16(self, slave: int, address: int, value: int) -> None:
         value = int(value)
@@ -117,15 +121,24 @@ class ModbusBus:
             instrument.write_register(
                 int(address), value, number_of_decimals=0, functioncode=6, signed=True
             )
+            time.sleep(self.inter_frame_s)
 
     def write_u32(self, slave: int, address: int, value: int, *, high_first: bool = True) -> None:
         value = int(value) & 0xFFFFFFFF
         high = (value >> 16) & 0xFFFF
         low = value & 0xFFFF
-        regs = [high, low] if high_first else [low, high]
+        # Match working /home/pi/ballscrew encoding: small values as (value, 0)
+        if high_first:
+            if value <= 0xFFFF:
+                regs = [value & 0xFFFF, 0]
+            else:
+                regs = [high, low]
+        else:
+            regs = [low, high]
         with self._lock:
             instrument = self._select(slave)
             instrument.write_registers(int(address), regs)
+            time.sleep(self.inter_frame_s)
 
     def write_i32(self, slave: int, address: int, value: int, *, high_first: bool = True) -> None:
         value = int(value)
@@ -136,27 +149,37 @@ class ModbusBus:
     def read_u16(self, slave: int, address: int) -> int:
         with self._lock:
             instrument = self._select(slave)
-            return int(
+            val = int(
                 instrument.read_register(
                     int(address), number_of_decimals=0, functioncode=3, signed=False
                 )
             )
+            time.sleep(self.inter_frame_s)
+            return val
 
     def read_i16(self, slave: int, address: int) -> int:
         with self._lock:
             instrument = self._select(slave)
-            return int(
+            val = int(
                 instrument.read_register(
                     int(address), number_of_decimals=0, functioncode=3, signed=True
                 )
             )
+            time.sleep(self.inter_frame_s)
+            return val
 
     def read_u32(self, slave: int, address: int, *, high_first: bool = True) -> int:
         with self._lock:
             instrument = self._select(slave)
             regs = instrument.read_registers(int(address), 2, functioncode=3)
+            time.sleep(self.inter_frame_s)
             a, b = int(regs[0]), int(regs[1])
             if high_first:
+                # Match working ballscrew decode for A6 word packing
+                if a == 0:
+                    return b
+                if b == 0:
+                    return a
                 return ((a & 0xFFFF) << 16) | (b & 0xFFFF)
             return ((b & 0xFFFF) << 16) | (a & 0xFFFF)
 
@@ -167,7 +190,9 @@ class ModbusBus:
     def read_holding(self, slave: int, address: int, count: int) -> Sequence[int]:
         with self._lock:
             instrument = self._select(slave)
-            return [int(v) for v in instrument.read_registers(int(address), int(count), functioncode=3)]
+            vals = [int(v) for v in instrument.read_registers(int(address), int(count), functioncode=3)]
+            time.sleep(self.inter_frame_s)
+            return vals
 
     @staticmethod
     def _parity_const(parity: str) -> str:
