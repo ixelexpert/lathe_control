@@ -29,6 +29,36 @@ logger = logging.getLogger(__name__)
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("dark-blue")
 
+LAMP_OFF = "#9e9e9e"
+LAMP_USB = "#f9a825"      # amber — USB adapter present, Modbus not proven
+LAMP_OK = "#2e7d32"       # green — drive Modbus reply received
+LAMP_BAD = "#c62828"      # red — connect/probe failed
+
+
+class StatusLamp(ctk.CTkFrame):
+    """Round status lamp with a short label."""
+
+    def __init__(self, master, label: str = "Modbus"):
+        super().__init__(master, fg_color="transparent")
+        self._canvas = tk.Canvas(self, width=22, height=22, highlightthickness=0, bg=self._bg())
+        self._canvas.pack(side="left")
+        self._dot = self._canvas.create_oval(3, 3, 19, 19, fill=LAMP_OFF, outline="#424242")
+        self._label_var = tk.StringVar(value=label)
+        ctk.CTkLabel(self, textvariable=self._label_var, width=90, anchor="w").pack(
+            side="left", padx=(6, 0)
+        )
+
+    def _bg(self) -> str:
+        try:
+            return self.master.cget("fg_color")[1] if isinstance(self.master.cget("fg_color"), (list, tuple)) else "#dbdbdb"
+        except Exception:  # noqa: BLE001
+            return "#dbdbdb"
+
+    def set_state(self, color: str, text: str | None = None) -> None:
+        self._canvas.itemconfigure(self._dot, fill=color)
+        if text is not None:
+            self._label_var.set(text)
+
 
 class ParamEntry(ctk.CTkFrame):
     def __init__(self, master, label: str, *, readonly: bool = False, width: int = 120):
@@ -77,6 +107,7 @@ class LatheApp(ctk.CTk):
         self._load_fields_from_config()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(200, self._poll_tick)
+        self.after(400, self._startup_usb_and_modbus_check)
 
     def _build_ui(self) -> None:
         top = ctk.CTkFrame(self)
@@ -85,11 +116,19 @@ class LatheApp(ctk.CTk):
         ctk.CTkLabel(top, text="Serial port").pack(side="left", padx=(8, 4))
         configured_port = str(self.cfg.get("serial_port", ""))
         resolved_port, port_note = resolve_serial_port(configured_port)
+        self.cfg["serial_port"] = resolved_port
         self.port_var = tk.StringVar(value=resolved_port)
         ctk.CTkEntry(top, textvariable=self.port_var, width=280).pack(side="left")
         ctk.CTkButton(top, text="Rescan", width=70, command=self._rescan_serial).pack(
             side="left", padx=4
         )
+
+        self.modbus_lamp = StatusLamp(top, label="Modbus: …")
+        self.modbus_lamp.pack(side="left", padx=(10, 4))
+        if Path(resolved_port).exists() or Path(resolved_port).is_symlink():
+            self.modbus_lamp.set_state(LAMP_USB, "Modbus: USB only")
+        else:
+            self.modbus_lamp.set_state(LAMP_BAD, "Modbus: no USB")
 
         self.btn_connect = ctk.CTkButton(top, text="Connect", width=100, command=self._connect)
         self.btn_connect.pack(side="left", padx=6)
@@ -135,15 +174,95 @@ class LatheApp(ctk.CTk):
         self._syncing = False
         self._z_step_busy = False
 
-    def _rescan_serial(self) -> None:
+    def _set_modbus_lamp(self, color: str, text: str) -> None:
+        self.modbus_lamp.set_state(color, text)
+
+    def _assign_usb_port(self) -> tuple[str, str]:
         port, note = resolve_serial_port(self.port_var.get().strip())
         self.port_var.set(port)
-        # Show resolved target as well as by-id -> tty mapping when possible
+        self.cfg["serial_port"] = port
+        try:
+            target = Path(port).resolve()
+            note = f"{note}"
+            if str(target) != port:
+                note = f"{note}"
+        except Exception:  # noqa: BLE001
+            pass
+        return port, note
+
+    def _rescan_serial(self) -> None:
+        port, note = self._assign_usb_port()
+        exists = Path(port).exists() or Path(port).is_symlink()
+        if exists and not self.modbus_ready:
+            self._set_modbus_lamp(LAMP_USB, "Modbus: USB only")
+        elif not exists:
+            self._set_modbus_lamp(LAMP_BAD, "Modbus: no USB")
         try:
             target = Path(port).resolve()
             self.status_var.set(f"{note} → {target}")
         except Exception:  # noqa: BLE001
             self.status_var.set(note)
+        # Re-check Modbus on the newly assigned port
+        self.after(50, self._startup_usb_and_modbus_check)
+
+    def _startup_usb_and_modbus_check(self) -> None:
+        """On startup / rescan: assign USB path, then probe Modbus without blocking UI."""
+        if self.bus and self.bus.connected:
+            return
+
+        port, note = self._assign_usb_port()
+        exists = Path(port).exists() or Path(port).is_symlink()
+        if not exists:
+            self._set_modbus_lamp(LAMP_BAD, "Modbus: no USB")
+            self.status_var.set(f"{note} — adapter not found")
+            return
+
+        self._set_modbus_lamp(LAMP_USB, "Modbus: checking…")
+        self.status_var.set(f"{note} — probing drives…")
+
+        def worker() -> None:
+            detail = ""
+            ready = False
+            try:
+                bp = ballscrew_params_from_config(self.cfg)
+                cp = chuck_params_from_config(self.cfg)
+                mb = self.cfg.get("modbus", {})
+                bus = ModbusBus(
+                    port,
+                    baudrate=bp.baud,
+                    parity=str(mb.get("parity", "N")),
+                    stopbits=int(mb.get("stopbits", 1)),
+                    bytesize=int(mb.get("bytesize", 8)),
+                    timeout=0.4,
+                )
+                bus.connect()
+                for sid in (bp.slave_id, cp.slave_id):
+                    try:
+                        mode = bus.read_u16(sid, 0x0000)
+                        detail += f" slave{sid}=OK({mode})"
+                        ready = True
+                    except Exception as exc:  # noqa: BLE001
+                        detail += f" slave{sid}=no-reply"
+                        logger.debug("startup probe slave %s: %s", sid, exc)
+                bus.disconnect()
+            except Exception as exc:  # noqa: BLE001
+                detail = str(exc)
+                ready = False
+
+            def finish() -> None:
+                if ready:
+                    self._set_modbus_lamp(LAMP_OK, "Modbus: connected")
+                    self.status_var.set(f"USB OK. Modbus reply:{detail}. Click Connect to use axes.")
+                else:
+                    self._set_modbus_lamp(LAMP_USB, "Modbus: USB only")
+                    self.status_var.set(
+                        f"USB assigned ({port}) but no drive reply.{detail}. "
+                        "Check RS485 wiring/power, then Connect or Rescan."
+                    )
+
+            self.after(0, finish)
+
+        threading.Thread(target=worker, name="ModbusProbe", daemon=True).start()
 
     def _build_setup_tab(self, parent: ctk.CTkFrame) -> None:
         cycle_bar = ctk.CTkFrame(parent, fg_color="transparent")
@@ -518,6 +637,7 @@ class LatheApp(ctk.CTk):
 
             if not reply_ok:
                 self.modbus_ready = False
+                self._set_modbus_lamp(LAMP_USB, "Modbus: USB only")
                 self.status_var.set(
                     f"Serial open on {port}, but NO Modbus reply from drives.{reply_detail}. "
                     "Motion disabled until RS485 works — check AC power, CN3 485+/485-/GND, "
@@ -530,13 +650,16 @@ class LatheApp(ctk.CTk):
                 self.chuck.configure()
             except Exception as cfg_exc:  # noqa: BLE001
                 self.modbus_ready = False
+                self._set_modbus_lamp(LAMP_USB, "Modbus: config fail")
                 self.status_var.set(f"Drive answered, but configure failed: {cfg_exc}")
                 return
 
             self.modbus_ready = True
+            self._set_modbus_lamp(LAMP_OK, "Modbus: connected")
             self.status_var.set(f"Connected on {port}.{reply_detail}")
         except Exception as exc:  # noqa: BLE001
             logger.exception("Connect failed")
+            self._set_modbus_lamp(LAMP_BAD, "Modbus: failed")
             self.status_var.set(f"Connect failed: {exc}")
             self._disconnect()
 
@@ -561,6 +684,11 @@ class LatheApp(ctk.CTk):
         self.modbus_ready = False
         self.btn_connect.configure(state="normal")
         self.btn_disconnect.configure(state="disabled")
+        port = self.port_var.get().strip()
+        if Path(port).exists() or Path(port).is_symlink():
+            self._set_modbus_lamp(LAMP_USB, "Modbus: USB only")
+        else:
+            self._set_modbus_lamp(LAMP_BAD, "Modbus: no USB")
         self.status_var.set("Disconnected")
 
     def _save_config(self) -> None:

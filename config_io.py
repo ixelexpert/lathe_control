@@ -43,21 +43,22 @@ def detect_serial_port() -> str | None:
 def resolve_serial_port(configured: str | None) -> tuple[str, str]:
     """Pick serial port for startup.
 
-    Returns (port_path, note). Prefers live detection of the QinHeng adapter;
-    falls back to configured path.
+    Always prefers a live-detected QinHeng / non-Arduino adapter when present.
+    Returns (port_path, note).
     """
     detected = detect_serial_port()
     configured = (configured or "").strip()
     if detected:
-        note = f"Detected {detected}"
-        if configured and configured != detected:
-            # If configured by-id still exists, keep it (stable); else use detected
-            if Path(configured).exists():
-                return configured, f"Using configured port {configured} (also detected {detected})"
-            return detected, f"Configured port missing; using detected {detected}"
+        try:
+            target = Path(detected).resolve()
+            note = f"USB assigned: {detected} → {target}"
+        except Exception:  # noqa: BLE001
+            note = f"USB assigned: {detected}"
         return detected, note
+    if configured and Path(configured).exists():
+        return configured, f"Using configured port {configured}"
     if configured:
-        return configured, f"Using configured port {configured} (no adapter auto-detected)"
+        return configured, f"Configured port not present: {configured}"
     return "/dev/ttyACM0", "No serial adapter detected; defaulting to /dev/ttyACM0"
 
 
