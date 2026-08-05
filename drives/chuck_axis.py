@@ -69,14 +69,30 @@ class ChuckAxis:
         chuck = units.chuck_motor_to_axis_rpm(motor_rpm, self.params.gear_ratio)
         self.set_axis_speed(chuck)
 
-    def configure(self) -> None:
+    def write_cycle_params(self) -> None:
+        """Write speed-mode + motion params to the chuck drive without enabling.
+
+        Called once at the start of a cycle, before either axis moves.
+        """
         sid = self.params.slave_id
+        self.bus.write_u16(sid, C04_11, 0)
+        time.sleep(0.02)
         self.bus.write_u16(sid, C00_00, 1)  # speed mode
         self.bus.write_u16(sid, C03_20, 3)  # internal planned speed
         self.bus.write_u16(sid, C12_00, 1)  # cyclic
         self.apply_motion_params()
         self._configured = True
-        logger.info("Chuck axis configured (slave %s)", sid)
+        logger.info(
+            "Cycle params → drive %s: motor_rpm=%s accel=%sms decel=%sms",
+            sid,
+            int(round(self._command_motor_rpm())),
+            int(self.params.acceleration_ms),
+            int(self.params.deceleration_ms),
+        )
+
+    def configure(self) -> None:
+        self.write_cycle_params()
+        logger.info("Chuck axis configured (slave %s)", self.params.slave_id)
 
     def apply_motion_params(self) -> None:
         sid = self.params.slave_id

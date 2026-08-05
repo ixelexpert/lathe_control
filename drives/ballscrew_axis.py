@@ -114,10 +114,41 @@ class BallscrewAxis:
             signed = -signed
         return units.ballscrew_mm_to_pulses(signed, **self._conv_kwargs())
 
-    def configure(self) -> None:
-        # Full config happens per-move (must be disabled first). Mark ready.
+    def write_cycle_params(self) -> None:
+        """Write mode + motion params to the ballscrew drive without enabling or triggering.
+
+        Called once at the start of a cycle, before either axis moves.
+        """
+        sid = self.params.slave_id
+        pulses = self._distance_pulses(self.params.distance_mm)
+        rpm = max(1, int(round(self.motor_speed_rpm)))
+        bus = self.bus
+        bus.write_u16(sid, C04_01, 0)
+        bus.write_u16(sid, C04_11, 0)
+        time.sleep(0.05)
+        bus.write_u16(sid, C00_00, 0)  # position
+        bus.write_u16(sid, C12_00, 0)
+        bus.write_u16(sid, C03_00, 1)  # multi-segment
+        bus.write_u16(sid, C11_00, 0)
+        bus.write_u16(sid, C11_01, 1)  # relative
+        bus.write_u16(sid, C11_03, 1)
+        bus.write_u16(sid, C11_04, 1)
+        bus.write_i32(sid, C11_06, pulses)
+        bus.write_u16(sid, C11_08, rpm)
+        bus.write_u32(sid, C11_0A, int(round(self.params.acceleration_ms)))
+        bus.write_u32(sid, C11_0C, int(round(self.params.deceleration_ms)))
+        bus.write_u32(sid, C11_0E, 0)
+        bus.write_u16(sid, C04_00, DI1_PROFILE_TRIGGER)
+        bus.write_u16(sid, C04_01, 0)
         self._configured = True
-        logger.info("Ballscrew axis ready (slave %s)", self.params.slave_id)
+        logger.info(
+            "Cycle params → drive %s: delta=%s rpm=%s accel=%sms decel=%sms",
+            sid,
+            pulses,
+            rpm,
+            int(self.params.acceleration_ms),
+            int(self.params.deceleration_ms),
+        )
 
     def apply_motion_params(self, distance_mm: float | None = None) -> int:
         dist = self.params.distance_mm if distance_mm is None else float(distance_mm)

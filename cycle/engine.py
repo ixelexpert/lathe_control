@@ -84,6 +84,38 @@ class CycleEngine:
         errors: list[str] = []
         z_move_done = threading.Event()
 
+        # --- Pre-motion: write parameters to drive 1 then drive 2 ---
+        try:
+            self._set_state(CycleState.RUNNING, "Writing cycle params to drives…")
+            bus = self.ballscrew.bus
+            bus.begin_motion()
+            try:
+                logger.info("Cycle prep: writing params to ballscrew (drive %s)", self.ballscrew.params.slave_id)
+                self.ballscrew.write_cycle_params()
+                if self._stop.is_set():
+                    return
+                logger.info("Cycle prep: writing params to chuck (drive %s)", self.chuck.params.slave_id)
+                self.chuck.write_cycle_params()
+            finally:
+                bus.end_motion()
+            if self._stop.is_set():
+                self._set_state(CycleState.IDLE, "Cycle aborted during param write")
+                return
+            self._set_state(CycleState.RUNNING, "Params written — starting motion")
+            time.sleep(0.05)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Cycle param write failed")
+            self._set_state(CycleState.FAULT, f"Param write failed: {exc}")
+            try:
+                self.ballscrew.disable()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self.chuck.disable()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
         def ballscrew_branch() -> None:
             try:
                 bp = self.ballscrew.params
