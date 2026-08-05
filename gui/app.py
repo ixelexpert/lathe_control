@@ -1,0 +1,506 @@
+"""CustomTkinter lathe control GUI for Pi 400 + A6-400RS."""
+
+from __future__ import annotations
+
+import logging
+import tkinter as tk
+from pathlib import Path
+from typing import Any
+
+import customtkinter as ctk
+
+from config_io import (
+    apply_params_to_config,
+    ballscrew_params_from_config,
+    chuck_params_from_config,
+    load_config,
+    save_config,
+)
+from cycle.engine import CycleEngine, CycleState
+from drives.ballscrew_axis import BallscrewAxis
+from drives.chuck_axis import ChuckAxis
+from drives.modbus_bus import ModbusBus
+from drives import units
+
+logger = logging.getLogger(__name__)
+
+ctk.set_appearance_mode("light")
+ctk.set_default_color_theme("dark-blue")
+
+
+class ParamEntry(ctk.CTkFrame):
+    def __init__(self, master, label: str, *, readonly: bool = False, width: int = 120):
+        super().__init__(master, fg_color="transparent")
+        self.readonly = readonly
+        self.label = ctk.CTkLabel(self, text=label, anchor="w", width=200)
+        self.label.pack(side="left", padx=(0, 8))
+        self.var = tk.StringVar(value="")
+        state = "disabled" if readonly else "normal"
+        self.entry = ctk.CTkEntry(self, textvariable=self.var, width=width, state=state)
+        self.entry.pack(side="left")
+
+    def get_float(self) -> float:
+        return float(self.var.get().strip())
+
+    def get_int(self) -> int:
+        return int(float(self.var.get().strip()))
+
+    def set(self, value: Any) -> None:
+        text = f"{value:.4g}" if isinstance(value, float) else str(value)
+        if self.readonly:
+            self.entry.configure(state="normal")
+            self.var.set(text)
+            self.entry.configure(state="disabled")
+        else:
+            self.var.set(text)
+
+
+class LatheApp(ctk.CTk):
+    def __init__(self, config_path: Path | None = None) -> None:
+        super().__init__()
+        self.title("Lathe Control — Ballscrew + Chuck (Modbus RTU)")
+        self.geometry("1280x800")
+        self.minsize(1100, 700)
+
+        self.config_path = config_path or Path(__file__).resolve().parent.parent / "config.yaml"
+        self.cfg = load_config(self.config_path)
+
+        self.bus: ModbusBus | None = None
+        self.ballscrew: BallscrewAxis | None = None
+        self.chuck: ChuckAxis | None = None
+        self.cycle: CycleEngine | None = None
+
+        self._build_ui()
+        self._load_fields_from_config()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(200, self._poll_tick)
+
+    def _build_ui(self) -> None:
+        top = ctk.CTkFrame(self)
+        top.pack(fill="x", padx=12, pady=10)
+
+        ctk.CTkLabel(top, text="Serial port").pack(side="left", padx=(8, 4))
+        self.port_var = tk.StringVar(value=str(self.cfg.get("serial_port", "/dev/ttyUSB0")))
+        ctk.CTkEntry(top, textvariable=self.port_var, width=140).pack(side="left")
+
+        self.btn_connect = ctk.CTkButton(top, text="Connect", width=100, command=self._connect)
+        self.btn_connect.pack(side="left", padx=6)
+        self.btn_disconnect = ctk.CTkButton(
+            top, text="Disconnect", width=100, command=self._disconnect, state="disabled"
+        )
+        self.btn_disconnect.pack(side="left", padx=4)
+
+        ctk.CTkButton(top, text="Save Config", width=110, command=self._save_config).pack(
+            side="left", padx=8
+        )
+        ctk.CTkButton(top, text="Start Cycle", width=120, fg_color="#2e7d32", command=self._start_cycle).pack(
+            side="left", padx=6
+        )
+        ctk.CTkButton(top, text="Stop", width=90, command=self._stop_cycle).pack(side="left", padx=4)
+        ctk.CTkButton(
+            top,
+            text="E-STOP",
+            width=110,
+            fg_color="#c62828",
+            hover_color="#8e0000",
+            command=self._estop,
+        ).pack(side="left", padx=10)
+
+        self.status_var = tk.StringVar(value="Disconnected")
+        ctk.CTkLabel(top, textvariable=self.status_var, anchor="w").pack(
+            side="left", padx=12, fill="x", expand=True
+        )
+
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        left = ctk.CTkScrollableFrame(body, label_text="Ballscrew Axis")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        right = ctk.CTkScrollableFrame(body, label_text="Chuck Axis")
+        right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+
+        self.z_fields: dict[str, ParamEntry] = {}
+        z_specs = [
+            ("axis_speed", "Ballscrew_Axis_Speed (mm/s)"),
+            ("motor_speed", "Ballscrew_Motor_Speed (rpm)"),
+            ("accel", "Ballscrew_Acceleration (ms)"),
+            ("decel", "Ballscrew_Deceleration (ms)"),
+            ("distance", "Ballscrew_Distance (mm)"),
+            ("duration", "Ballscrew_Duration (s)", True),
+            ("baud", "Ballscrew_Baud"),
+            ("gear", "Ballscrew_Gear_Ratio"),
+            ("home", "Ballscrew_Home_Position (mm)"),
+            ("position", "Ballscrew_Position (mm)", True),
+            ("pitch", "Ballscrew_Pitch (mm/rev)"),
+            ("start_delay", "Ballscrew_Start_Delay (s)"),
+            ("end_delay", "Ballscrew_End_Delay (s)"),
+            ("live_axis_speed", "Live Axis Speed (mm/s)", True),
+            ("live_motor_speed", "Live Motor Speed (rpm)", True),
+        ]
+        for spec in z_specs:
+            key, label = spec[0], spec[1]
+            readonly = len(spec) > 2 and spec[2]
+            pe = ParamEntry(left, label, readonly=readonly)
+            pe.pack(fill="x", pady=3)
+            self.z_fields[key] = pe
+
+        z_btns = ctk.CTkFrame(left, fg_color="transparent")
+        z_btns.pack(fill="x", pady=10)
+        ctk.CTkButton(z_btns, text="Apply Z Params", command=self._apply_z_from_gui).pack(
+            side="left", padx=4
+        )
+        ctk.CTkButton(z_btns, text="Home Here", command=self._home_here).pack(side="left", padx=4)
+
+        self.c_fields: dict[str, ParamEntry] = {}
+        c_specs = [
+            ("axis_speed", "Chuck_Axis_Speed (rpm)"),
+            ("motor_speed", "Chuck_Motor_Speed (rpm)"),
+            ("accel", "Chuck_Acceleration (ms)"),
+            ("decel", "Chuck_Deceleration (ms)"),
+            ("duration", "Chuck_Duration (s)"),
+            ("baud", "Chuck_Baud"),
+            ("gear", "Chuck_Gear_Ratio"),
+            ("start_delay", "Chuck_Start_Delay (s)"),
+            ("end_delay", "Chuck_End_Delay (s)"),
+            ("live_axis_speed", "Live Chuck Speed (rpm)", True),
+            ("live_motor_speed", "Live Motor Speed (rpm)", True),
+        ]
+        for spec in c_specs:
+            key, label = spec[0], spec[1]
+            readonly = len(spec) > 2 and spec[2]
+            pe = ParamEntry(right, label, readonly=readonly)
+            pe.pack(fill="x", pady=3)
+            self.c_fields[key] = pe
+
+        c_btns = ctk.CTkFrame(right, fg_color="transparent")
+        c_btns.pack(fill="x", pady=10)
+        ctk.CTkButton(c_btns, text="Apply Chuck Params", command=self._apply_c_from_gui).pack(
+            side="left", padx=4
+        )
+
+        note = (
+            "Directions: Ballscrew CW+ / CCW− · Chuck CCW+ / CW− · "
+            "Chuck_Duration 0 = spin until ballscrew move completes · "
+            "Baud values must match on the shared RS485 bus."
+        )
+        ctk.CTkLabel(self, text=note, wraplength=1200, anchor="w").pack(
+            fill="x", padx=16, pady=(0, 10)
+        )
+
+        # Linked speed updates
+        self.z_fields["axis_speed"].var.trace_add("write", lambda *_: self._on_z_axis_speed())
+        self.z_fields["motor_speed"].var.trace_add("write", lambda *_: self._on_z_motor_speed())
+        self.z_fields["distance"].var.trace_add("write", lambda *_: self._update_z_duration())
+        self.z_fields["accel"].var.trace_add("write", lambda *_: self._update_z_duration())
+        self.z_fields["decel"].var.trace_add("write", lambda *_: self._update_z_duration())
+        self.c_fields["axis_speed"].var.trace_add("write", lambda *_: self._on_c_axis_speed())
+        self.c_fields["motor_speed"].var.trace_add("write", lambda *_: self._on_c_motor_speed())
+
+        self._syncing = False
+
+    def _load_fields_from_config(self) -> None:
+        bp = ballscrew_params_from_config(self.cfg)
+        cp = chuck_params_from_config(self.cfg)
+        self._syncing = True
+        try:
+            self.z_fields["axis_speed"].set(bp.axis_speed_mm_s)
+            self.z_fields["motor_speed"].set(
+                units.ballscrew_axis_speed_to_motor_rpm(
+                    bp.axis_speed_mm_s, pitch_mm=bp.pitch_mm, gear_ratio=bp.gear_ratio
+                )
+            )
+            self.z_fields["accel"].set(bp.acceleration_ms)
+            self.z_fields["decel"].set(bp.deceleration_ms)
+            self.z_fields["distance"].set(bp.distance_mm)
+            self.z_fields["baud"].set(bp.baud)
+            self.z_fields["gear"].set(bp.gear_ratio)
+            self.z_fields["home"].set(bp.home_position_mm)
+            self.z_fields["position"].set(0.0)
+            self.z_fields["pitch"].set(bp.pitch_mm)
+            self.z_fields["start_delay"].set(bp.start_delay_s)
+            self.z_fields["end_delay"].set(bp.end_delay_s)
+            self.z_fields["duration"].set(
+                units.estimate_move_duration_s(
+                    bp.distance_mm, bp.axis_speed_mm_s, bp.acceleration_ms, bp.deceleration_ms
+                )
+            )
+
+            self.c_fields["axis_speed"].set(cp.axis_speed_rpm)
+            self.c_fields["motor_speed"].set(
+                units.chuck_axis_to_motor_rpm(cp.axis_speed_rpm, cp.gear_ratio)
+            )
+            self.c_fields["accel"].set(cp.acceleration_ms)
+            self.c_fields["decel"].set(cp.deceleration_ms)
+            self.c_fields["duration"].set(cp.duration_s)
+            self.c_fields["baud"].set(cp.baud)
+            self.c_fields["gear"].set(cp.gear_ratio)
+            self.c_fields["start_delay"].set(cp.start_delay_s)
+            self.c_fields["end_delay"].set(cp.end_delay_s)
+        finally:
+            self._syncing = False
+
+    def _on_z_axis_speed(self) -> None:
+        if self._syncing:
+            return
+        try:
+            axis = self.z_fields["axis_speed"].get_float()
+            pitch = self.z_fields["pitch"].get_float()
+            gear = self.z_fields["gear"].get_float()
+            motor = units.ballscrew_axis_speed_to_motor_rpm(
+                axis, pitch_mm=pitch, gear_ratio=gear
+            )
+            self._syncing = True
+            self.z_fields["motor_speed"].set(motor)
+        except ValueError:
+            return
+        finally:
+            self._syncing = False
+        self._update_z_duration()
+
+    def _on_z_motor_speed(self) -> None:
+        if self._syncing:
+            return
+        try:
+            motor = self.z_fields["motor_speed"].get_float()
+            pitch = self.z_fields["pitch"].get_float()
+            gear = self.z_fields["gear"].get_float()
+            axis = units.ballscrew_motor_rpm_to_axis_speed(
+                motor, pitch_mm=pitch, gear_ratio=gear
+            )
+            self._syncing = True
+            self.z_fields["axis_speed"].set(axis)
+        except ValueError:
+            return
+        finally:
+            self._syncing = False
+        self._update_z_duration()
+
+    def _update_z_duration(self) -> None:
+        try:
+            d = units.estimate_move_duration_s(
+                self.z_fields["distance"].get_float(),
+                self.z_fields["axis_speed"].get_float(),
+                self.z_fields["accel"].get_float(),
+                self.z_fields["decel"].get_float(),
+            )
+            self.z_fields["duration"].set(d)
+        except ValueError:
+            pass
+
+    def _on_c_axis_speed(self) -> None:
+        if self._syncing:
+            return
+        try:
+            axis = self.c_fields["axis_speed"].get_float()
+            gear = self.c_fields["gear"].get_float()
+            self._syncing = True
+            self.c_fields["motor_speed"].set(units.chuck_axis_to_motor_rpm(axis, gear))
+        except ValueError:
+            return
+        finally:
+            self._syncing = False
+
+    def _on_c_motor_speed(self) -> None:
+        if self._syncing:
+            return
+        try:
+            motor = self.c_fields["motor_speed"].get_float()
+            gear = self.c_fields["gear"].get_float()
+            self._syncing = True
+            self.c_fields["axis_speed"].set(units.chuck_motor_to_axis_rpm(motor, gear))
+        except ValueError:
+            return
+        finally:
+            self._syncing = False
+
+    def _read_gui_into_params(self) -> tuple:
+        bp = ballscrew_params_from_config(self.cfg)
+        cp = chuck_params_from_config(self.cfg)
+
+        bp.axis_speed_mm_s = self.z_fields["axis_speed"].get_float()
+        bp.acceleration_ms = self.z_fields["accel"].get_float()
+        bp.deceleration_ms = self.z_fields["decel"].get_float()
+        bp.distance_mm = self.z_fields["distance"].get_float()
+        bp.baud = self.z_fields["baud"].get_int()
+        bp.gear_ratio = self.z_fields["gear"].get_float()
+        bp.home_position_mm = self.z_fields["home"].get_float()
+        bp.pitch_mm = self.z_fields["pitch"].get_float()
+        bp.start_delay_s = self.z_fields["start_delay"].get_float()
+        bp.end_delay_s = self.z_fields["end_delay"].get_float()
+
+        cp.axis_speed_rpm = self.c_fields["axis_speed"].get_float()
+        cp.acceleration_ms = self.c_fields["accel"].get_float()
+        cp.deceleration_ms = self.c_fields["decel"].get_float()
+        cp.duration_s = self.c_fields["duration"].get_float()
+        cp.baud = self.c_fields["baud"].get_int()
+        cp.gear_ratio = self.c_fields["gear"].get_float()
+        cp.start_delay_s = self.c_fields["start_delay"].get_float()
+        cp.end_delay_s = self.c_fields["end_delay"].get_float()
+
+        if abs(bp.axis_speed_mm_s) > bp.max_axis_mm_s:
+            raise ValueError(f"Ballscrew speed exceeds {bp.max_axis_mm_s} mm/s")
+        if abs(cp.axis_speed_rpm) > cp.max_chuck_rpm:
+            raise ValueError(f"Chuck speed exceeds {cp.max_chuck_rpm} rpm")
+        if bp.baud != cp.baud:
+            raise ValueError("Ballscrew_Baud and Chuck_Baud must match (shared RS485 bus)")
+
+        return bp, cp
+
+    def _apply_z_from_gui(self) -> None:
+        try:
+            bp, cp = self._read_gui_into_params()
+            if self.ballscrew:
+                self.ballscrew.params = bp
+                if self.bus and self.bus.connected:
+                    self.ballscrew.apply_motion_params()
+            self.status_var.set("Ballscrew params applied")
+        except Exception as exc:  # noqa: BLE001
+            self.status_var.set(f"Z apply error: {exc}")
+
+    def _apply_c_from_gui(self) -> None:
+        try:
+            bp, cp = self._read_gui_into_params()
+            if self.chuck:
+                self.chuck.params = cp
+                if self.bus and self.bus.connected:
+                    self.chuck.apply_motion_params()
+            self.status_var.set("Chuck params applied")
+        except Exception as exc:  # noqa: BLE001
+            self.status_var.set(f"Chuck apply error: {exc}")
+
+    def _connect(self) -> None:
+        try:
+            bp, cp = self._read_gui_into_params()
+            port = self.port_var.get().strip()
+            mb = self.cfg.get("modbus", {})
+            self.bus = ModbusBus(
+                port,
+                baudrate=bp.baud,
+                parity=str(mb.get("parity", "N")),
+                stopbits=int(mb.get("stopbits", 1)),
+                bytesize=int(mb.get("bytesize", 8)),
+                timeout=float(mb.get("timeout_s", 1.0)),
+            )
+            self.bus.connect()
+            self.ballscrew = BallscrewAxis(self.bus, bp)
+            self.chuck = ChuckAxis(self.bus, cp)
+            self.ballscrew.configure()
+            self.chuck.configure()
+            self.cycle = CycleEngine(self.ballscrew, self.chuck)
+            self.cycle.on_state = self._on_cycle_state
+            self.btn_connect.configure(state="disabled")
+            self.btn_disconnect.configure(state="normal")
+            self.status_var.set(f"Connected on {port}")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Connect failed")
+            self.status_var.set(f"Connect failed: {exc}")
+            self._disconnect()
+
+    def _disconnect(self) -> None:
+        if self.cycle and self.cycle.busy:
+            self.cycle.estop()
+        for axis in (self.chuck, self.ballscrew):
+            if axis is not None:
+                try:
+                    axis.disable()
+                except Exception:  # noqa: BLE001
+                    pass
+        if self.bus is not None:
+            try:
+                self.bus.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+        self.bus = None
+        self.ballscrew = None
+        self.chuck = None
+        self.cycle = None
+        self.btn_connect.configure(state="normal")
+        self.btn_disconnect.configure(state="disabled")
+        self.status_var.set("Disconnected")
+
+    def _save_config(self) -> None:
+        try:
+            bp, cp = self._read_gui_into_params()
+            self.cfg = apply_params_to_config(self.cfg, bp, cp, self.port_var.get().strip())
+            save_config(self.cfg, self.config_path)
+            self.status_var.set(f"Saved {self.config_path}")
+        except Exception as exc:  # noqa: BLE001
+            self.status_var.set(f"Save failed: {exc}")
+
+    def _start_cycle(self) -> None:
+        if not self.cycle or not self.bus or not self.bus.connected:
+            self.status_var.set("Connect before starting a cycle")
+            return
+        try:
+            bp, cp = self._read_gui_into_params()
+            self.ballscrew.params = bp
+            self.chuck.params = cp
+            self.cycle.start()
+        except Exception as exc:  # noqa: BLE001
+            self.status_var.set(f"Start failed: {exc}")
+
+    def _stop_cycle(self) -> None:
+        if self.cycle:
+            self.cycle.stop()
+        else:
+            self.status_var.set("Nothing running")
+
+    def _estop(self) -> None:
+        if self.cycle:
+            self.cycle.estop()
+        else:
+            for axis in (self.chuck, self.ballscrew):
+                if axis is not None:
+                    try:
+                        axis.disable()
+                    except Exception:  # noqa: BLE001
+                        pass
+        self.status_var.set("E-STOP — drives disabled")
+
+    def _home_here(self) -> None:
+        if not self.ballscrew or not self.bus or not self.bus.connected:
+            self.status_var.set("Connect before Home Here")
+            return
+        try:
+            self.ballscrew.home_here()
+            self.z_fields["home"].set(self.ballscrew.params.home_position_mm)
+            self.z_fields["position"].set(self.ballscrew.status.position_mm)
+            self.status_var.set("Home Here set")
+        except Exception as exc:  # noqa: BLE001
+            self.status_var.set(f"Home Here failed: {exc}")
+
+    def _on_cycle_state(self, state: CycleState, message: str) -> None:
+        self.after(0, lambda: self.status_var.set(f"{state.value}: {message}"))
+
+    def _poll_tick(self) -> None:
+        try:
+            if self.bus and self.bus.connected and self.ballscrew and self.chuck:
+                zs = self.ballscrew.poll()
+                cs = self.chuck.poll()
+                self.z_fields["position"].set(zs.position_mm)
+                self.z_fields["live_axis_speed"].set(zs.axis_speed_mm_s)
+                self.z_fields["live_motor_speed"].set(zs.motor_rpm)
+                self.c_fields["live_axis_speed"].set(cs.axis_rpm)
+                self.c_fields["live_motor_speed"].set(cs.motor_rpm)
+                err = zs.last_error or cs.last_error
+                if err and not (self.cycle and self.cycle.busy):
+                    # keep soft — don't spam over cycle messages
+                    pass
+        except Exception:  # noqa: BLE001
+            logger.debug("poll tick error", exc_info=True)
+        self.after(200, self._poll_tick)
+
+    def _on_close(self) -> None:
+        try:
+            self._estop()
+            self._disconnect()
+        finally:
+            self.destroy()
+
+
+def run_app(config_path: Path | None = None) -> None:
+    app = LatheApp(config_path=config_path)
+    app.mainloop()

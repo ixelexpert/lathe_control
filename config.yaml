@@ -1,0 +1,44 @@
+# Lathe control defaults for Raspberry Pi 400 + A6-400RS (Modbus RTU)
+serial_port: /dev/ttyUSB0
+# On Windows testing you may use COM3 etc.
+
+ballscrew:
+  slave_id: 1
+  baud: 115200
+  gear_ratio: 1.0          # motor revolutions per load revolution
+  pitch_mm: 10.0           # mm per ballscrew revolution
+  pulses_per_rev: 10000    # C00.02 default
+  axis_speed_mm_s: 20.0    # keep low for first tests (max 200)
+  acceleration_ms: 200
+  deceleration_ms: 200
+  distance_mm: 50.0
+  home_position_mm: 0.0
+  soft_min_mm: 0.0
+  soft_max_mm: 500.0
+  start_delay_s: 0.0
+  end_delay_s: 0.0
+  # CW positive, CCW negative (sign applied to commanded distance)
+  invert_direction: false
+
+chuck:
+  slave_id: 2
+  baud: 115200
+  gear_ratio: 4.0          # motor rpm = chuck rpm * gear_ratio
+  axis_speed_rpm: 60.0     # chuck rpm (max 300)
+  acceleration_ms: 200
+  deceleration_ms: 200
+  duration_s: 0.0          # 0 = run until ballscrew finishes
+  start_delay_s: 0.0
+  end_delay_s: 0.0
+  # CCW positive, CW negative
+  invert_direction: false
+
+limits:
+  max_ballscrew_mm_s: 200.0
+  max_chuck_rpm: 300.0
+
+modbus:
+  parity: N
+  stopbits: 1
+  bytesize: 8
+  timeout_s: 1.0
