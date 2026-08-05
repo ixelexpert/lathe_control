@@ -1,4 +1,4 @@
-"""Shared Modbus RTU bus for A6-RS drives using minimalmodbus."""
+"""Raw Modbus RTU for A6-400RS — ported from the proven /home/pi/ballscrew/a6.py client."""
 
 from __future__ import annotations
 
@@ -7,20 +7,26 @@ import threading
 import time
 from typing import Sequence
 
-import minimalmodbus
 import serial
 
 logger = logging.getLogger(__name__)
 
 
+def crc16(data: bytes) -> int:
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc & 0xFFFF
+
+
+class ModbusException(RuntimeError):
+    pass
+
+
 class ModbusBus:
-    """Thread-safe Modbus RTU bus for one or more A6-RS drives.
-
-    Uses minimalmodbus (RTU). A6 register addresses map from parameter codes:
-    C03.0C -> 0x030C, C12.0A -> 0x120A, etc.
-
-    Single-register writes use function code 6 (matches StepperOnline examples).
-    """
+    """Thread-safe raw Modbus RTU bus (8E1 by default), multi-slave via unit id."""
 
     def __init__(
         self,
@@ -31,168 +37,169 @@ class ModbusBus:
         stopbits: int = 1,
         bytesize: int = 8,
         timeout: float = 0.5,
-        handle_local_echo: bool = False,
         inter_frame_s: float = 0.02,
+        handle_local_echo: bool = False,  # unused; kept for call-site compat
     ) -> None:
         self.port = port
         self.baudrate = baudrate
-        self.parity = parity
+        self.parity = (parity or "E").upper()
         self.stopbits = stopbits
         self.bytesize = bytesize
         self.timeout = timeout
-        self.handle_local_echo = handle_local_echo
         self.inter_frame_s = inter_frame_s
+        self._ser: serial.Serial | None = None
         self._lock = threading.RLock()
         self._connected = False
-        # One Instrument; slave address is switched per transaction.
-        self._instrument: minimalmodbus.Instrument | None = None
 
     @property
     def connected(self) -> bool:
-        return self._connected
+        return self._connected and self._ser is not None and self._ser.is_open
 
     def connect(self) -> None:
         with self._lock:
+            parity = {
+                "N": serial.PARITY_NONE,
+                "E": serial.PARITY_EVEN,
+                "O": serial.PARITY_ODD,
+            }.get(self.parity[:1], serial.PARITY_EVEN)
             try:
-                instrument = minimalmodbus.Instrument(
-                    self.port,
-                    1,
-                    mode=minimalmodbus.MODE_RTU,
-                    close_port_after_each_call=False,
-                    debug=False,
+                self._ser = serial.Serial(
+                    port=self.port,
+                    baudrate=self.baudrate,
+                    bytesize=self.bytesize,
+                    parity=parity,
+                    stopbits=self.stopbits,
+                    timeout=self.timeout,
                 )
-                instrument.serial.baudrate = self.baudrate
-                instrument.serial.bytesize = self.bytesize
-                instrument.serial.parity = self._parity_const(self.parity)
-                instrument.serial.stopbits = self.stopbits
-                instrument.serial.timeout = self.timeout
-                instrument.clear_buffers_before_each_transaction = True
-                instrument.handle_local_echo = self.handle_local_echo
-                # Open the port now so failures surface at Connect time
-                if not instrument.serial.is_open:
-                    instrument.serial.open()
             except Exception as exc:  # noqa: BLE001
                 self._connected = False
-                self._instrument = None
+                self._ser = None
                 raise ConnectionError(f"Failed to open serial port {self.port}: {exc}") from exc
-
-            self._instrument = instrument
             self._connected = True
-            logger.info(
-                "minimalmodbus RTU connected on %s @ %s", self.port, self.baudrate
-            )
+            logger.info("A6 RTU connected on %s @ %s 8%s1", self.port, self.baudrate, self.parity)
 
     def disconnect(self) -> None:
         with self._lock:
             try:
-                if self._instrument is not None and self._instrument.serial.is_open:
-                    self._instrument.serial.close()
+                if self._ser is not None:
+                    self._ser.close()
             finally:
-                self._instrument = None
+                self._ser = None
                 self._connected = False
                 logger.info("Modbus disconnected")
 
-    def _ensure(self) -> minimalmodbus.Instrument:
-        if not self._connected or self._instrument is None:
+    def _ensure(self) -> serial.Serial:
+        if not self.connected or self._ser is None:
             raise ConnectionError("Modbus bus is not connected")
-        return self._instrument
+        return self._ser
 
-    def _select(self, slave: int) -> minimalmodbus.Instrument:
-        instrument = self._ensure()
-        instrument.address = int(slave)
-        return instrument
+    def _txn(self, unit: int, pdu_body: bytes, expect_len: int) -> bytes:
+        """Send [unit]+pdu_body+CRC and read expect_len bytes."""
+        ser = self._ensure()
+        pdu = bytes([unit & 0xFF]) + pdu_body
+        frame = pdu + bytes([crc16(pdu) & 0xFF, (crc16(pdu) >> 8) & 0xFF])
+        ser.reset_input_buffer()
+        ser.write(frame)
+        if self.inter_frame_s:
+            time.sleep(self.inter_frame_s)
+        deadline = time.monotonic() + self.timeout
+        buf = bytearray()
+        while len(buf) < expect_len and time.monotonic() < deadline:
+            chunk = ser.read(expect_len - len(buf))
+            if chunk:
+                buf.extend(chunk)
+        resp = bytes(buf)
+        if len(resp) < 3:
+            raise ModbusException(f"no/short reply to {pdu.hex(' ')} (got {resp.hex(' ')})")
+        if resp[0] != (unit & 0xFF):
+            raise ModbusException(f"wrong unit in reply {resp.hex(' ')}")
+        if resp[1] & 0x80:
+            code = resp[2] if len(resp) > 2 else -1
+            raise ModbusException(f"Modbus exception {code} for {pdu.hex(' ')}")
+        body, got_crc = resp[:-2], resp[-2] | (resp[-1] << 8)
+        if crc16(body) != got_crc:
+            raise ModbusException(f"CRC error in reply {resp.hex(' ')}")
+        return resp
 
     def write_u16(self, slave: int, address: int, value: int) -> None:
-        value = int(value) & 0xFFFF
+        val = int(value) & 0xFFFF
+        pdu = bytes(
+            [
+                0x06,
+                (address >> 8) & 0xFF,
+                address & 0xFF,
+                (val >> 8) & 0xFF,
+                val & 0xFF,
+            ]
+        )
         with self._lock:
-            instrument = self._select(slave)
-            # FC06 — single register (A6 examples)
-            instrument.write_register(
-                int(address), value, number_of_decimals=0, functioncode=6, signed=False
-            )
-            time.sleep(self.inter_frame_s)
+            self._txn(slave, pdu, 8)
 
     def write_i16(self, slave: int, address: int, value: int) -> None:
         value = int(value)
         if value < -32768 or value > 32767:
             raise ValueError(f"I16 out of range: {value}")
-        with self._lock:
-            instrument = self._select(slave)
-            instrument.write_register(
-                int(address), value, number_of_decimals=0, functioncode=6, signed=True
-            )
-            time.sleep(self.inter_frame_s)
+        self.write_u16(slave, address, value & 0xFFFF)
 
     def write_u32(self, slave: int, address: int, value: int, *, high_first: bool = False) -> None:
-        """Write 32-bit value as two registers.
-
-        A6-RS vendor examples and the working /home/pi/ballscrew stack use
-        **low word first** (C0A.06 style used on this rig).
-        """
-        value = int(value) & 0xFFFFFFFF
-        low = value & 0xFFFF
-        high = (value >> 16) & 0xFFFF
-        regs = [high, low] if high_first else [low, high]
+        """FC10 two registers. Default LOW word first (proven A6 path)."""
+        u32 = int(value) & 0xFFFFFFFF
+        low = u32 & 0xFFFF
+        high = (u32 >> 16) & 0xFFFF
+        if high_first:
+            w0, w1 = high, low
+        else:
+            w0, w1 = low, high
+        pdu = bytes(
+            [
+                0x10,
+                (address >> 8) & 0xFF,
+                address & 0xFF,
+                0x00,
+                0x02,
+                0x04,
+                (w0 >> 8) & 0xFF,
+                w0 & 0xFF,
+                (w1 >> 8) & 0xFF,
+                w1 & 0xFF,
+            ]
+        )
         with self._lock:
-            instrument = self._select(slave)
-            instrument.write_registers(int(address), regs)
-            time.sleep(self.inter_frame_s)
+            self._txn(slave, pdu, 8)
 
     def write_i32(self, slave: int, address: int, value: int, *, high_first: bool = False) -> None:
-        value = int(value)
-        if value < 0:
-            value = (1 << 32) + value
-        self.write_u32(slave, address, value, high_first=high_first)
+        self.write_u32(slave, address, int(value), high_first=high_first)
+
+    def read_holding(self, slave: int, address: int, count: int) -> Sequence[int]:
+        pdu = bytes(
+            [
+                0x03,
+                (address >> 8) & 0xFF,
+                address & 0xFF,
+                (count >> 8) & 0xFF,
+                count & 0xFF,
+            ]
+        )
+        with self._lock:
+            resp = self._txn(slave, pdu, 3 + 2 * count + 2)
+        byte_count = resp[2]
+        data = resp[3 : 3 + byte_count]
+        return [(data[i] << 8) | data[i + 1] for i in range(0, len(data), 2)]
 
     def read_u16(self, slave: int, address: int) -> int:
-        with self._lock:
-            instrument = self._select(slave)
-            val = int(
-                instrument.read_register(
-                    int(address), number_of_decimals=0, functioncode=3, signed=False
-                )
-            )
-            time.sleep(self.inter_frame_s)
-            return val
+        return int(self.read_holding(slave, address, 1)[0]) & 0xFFFF
 
     def read_i16(self, slave: int, address: int) -> int:
-        with self._lock:
-            instrument = self._select(slave)
-            val = int(
-                instrument.read_register(
-                    int(address), number_of_decimals=0, functioncode=3, signed=True
-                )
-            )
-            time.sleep(self.inter_frame_s)
-            return val
+        raw = self.read_u16(slave, address)
+        return raw - 0x10000 if raw >= 0x8000 else raw
 
     def read_u32(self, slave: int, address: int, *, high_first: bool = False) -> int:
-        with self._lock:
-            instrument = self._select(slave)
-            regs = instrument.read_registers(int(address), 2, functioncode=3)
-            time.sleep(self.inter_frame_s)
-            a, b = int(regs[0]), int(regs[1])
-            if high_first:
-                return ((a & 0xFFFF) << 16) | (b & 0xFFFF)
-            # low word first (working ballscrew default)
-            return (a & 0xFFFF) | ((b & 0xFFFF) << 16)
+        regs = self.read_holding(slave, address, 2)
+        a, b = int(regs[0]) & 0xFFFF, int(regs[1]) & 0xFFFF
+        if high_first:
+            return (a << 16) | b
+        return a | (b << 16)
 
     def read_i32(self, slave: int, address: int, *, high_first: bool = False) -> int:
         raw = self.read_u32(slave, address, high_first=high_first)
         return raw - 0x100000000 if raw >= 0x80000000 else raw
-
-    def read_holding(self, slave: int, address: int, count: int) -> Sequence[int]:
-        with self._lock:
-            instrument = self._select(slave)
-            vals = [int(v) for v in instrument.read_registers(int(address), int(count), functioncode=3)]
-            time.sleep(self.inter_frame_s)
-            return vals
-
-    @staticmethod
-    def _parity_const(parity: str) -> str:
-        p = (parity or "N").upper()[:1]
-        if p == "E":
-            return serial.PARITY_EVEN
-        if p == "O":
-            return serial.PARITY_ODD
-        return serial.PARITY_NONE

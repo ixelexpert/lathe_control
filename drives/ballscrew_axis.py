@@ -1,8 +1,4 @@
-"""Ballscrew axis — A6-RS multi-position relative moves over Modbus.
-
-Matches the proven /home/pi/ballscrew path:
-  relative profile (C11.01=1), I32 displacement low-word-first, DI1 FunIN.19 edge.
-"""
+"""Ballscrew axis using the proven A6 multi-segment relative move handshake."""
 
 from __future__ import annotations
 
@@ -15,7 +11,6 @@ from . import units
 
 logger = logging.getLogger(__name__)
 
-# Registers
 C00_00 = 0x0000
 C03_00 = 0x0300
 C04_00 = 0x0400
@@ -31,8 +26,10 @@ C11_0A = 0x110A
 C11_0C = 0x110C
 C11_0E = 0x110E
 C12_00 = 0x1200
-U40_01 = 0x4001
 U40_16 = 0x4016
+U41_01 = 0x4101
+
+DI1_PROFILE_TRIGGER = 19
 
 
 @dataclass
@@ -40,12 +37,12 @@ class BallscrewParams:
     slave_id: int = 1
     baud: int = 115200
     gear_ratio: float = 1.0
-    pitch_mm: float = 5.0  # SFU1605 lead on this rig
+    pitch_mm: float = 5.0
     pulses_per_rev: int = 10000
-    axis_speed_mm_s: float = 20.0
+    axis_speed_mm_s: float = 10.0
     acceleration_ms: float = 200.0
     deceleration_ms: float = 200.0
-    distance_mm: float = 50.0
+    distance_mm: float = 10.0
     home_position_mm: float = 0.0
     soft_min_mm: float = -500.0
     soft_max_mm: float = 500.0
@@ -73,7 +70,6 @@ class BallscrewAxis:
         self.params = params or BallscrewParams()
         self.status = BallscrewStatus()
         self._home_offset_pulses: int = 0
-        self._homed = False
         self._configured = False
 
     def _conv_kwargs(self) -> dict:
@@ -86,7 +82,7 @@ class BallscrewAxis:
     @property
     def motor_speed_rpm(self) -> float:
         return units.ballscrew_axis_speed_to_motor_rpm(
-            self.params.axis_speed_mm_s,
+            abs(self.params.axis_speed_mm_s),
             pitch_mm=self.params.pitch_mm,
             gear_ratio=self.params.gear_ratio,
         )
@@ -112,55 +108,62 @@ class BallscrewAxis:
             self.params.deceleration_ms,
         )
 
-    def configure(self) -> None:
-        sid = self.params.slave_id
-        self.bus.write_u16(sid, C00_00, 0)  # position mode
-        self.bus.write_u16(sid, C12_00, 0)  # ensure speed profile not running
-        self.bus.write_u16(sid, C03_00, 1)  # multi-position reference
-        self.bus.write_u16(sid, C11_00, 0)  # single operation
-        self.bus.write_u16(sid, C11_01, 1)  # relative (absolute needs encoder battery)
-        self.bus.write_u16(sid, C11_03, 1)
-        self.bus.write_u16(sid, C11_04, 1)
-        self.bus.write_u16(sid, C04_00, 19)  # DI1 = FunIN.19 profile trigger
-        self.bus.write_u16(sid, C04_01, 0)  # ensure trigger low
-        self._configured = True
-        logger.info("Ballscrew axis configured (slave %s)", sid)
-
-    def apply_motion_params(self, distance_mm: float | None = None) -> int:
-        """Write displacement/speed/ramps. Returns signed pulse command."""
-        sid = self.params.slave_id
-        dist = self.params.distance_mm if distance_mm is None else float(distance_mm)
-        pulses = self._distance_pulses(dist)
-        rpm = max(1, int(round(abs(self.motor_speed_rpm))))
-        self.bus.write_u16(sid, C11_01, 1)  # force relative each move
-        self.bus.write_i32(sid, C11_06, pulses)
-        self.bus.write_u16(sid, C11_08, rpm)
-        self.bus.write_u32(sid, C11_0A, int(round(self.params.acceleration_ms)))
-        self.bus.write_u32(sid, C11_0C, int(round(self.params.deceleration_ms)))
-        self.bus.write_u32(sid, C11_0E, 0)
-        # Confirm drive stored the signed displacement (low-word-first readback)
-        try:
-            readback = self.bus.read_i32(sid, C11_06)
-            logger.info(
-                "Ballscrew cmd dist=%.3f mm -> %s pulses (readback %s) @ %s rpm",
-                dist,
-                pulses,
-                readback,
-                rpm,
-            )
-        except Exception:  # noqa: BLE001
-            logger.info("Ballscrew cmd dist=%.3f mm -> %s pulses @ %s rpm", dist, pulses, rpm)
-        return pulses
-
     def _distance_pulses(self, distance_mm: float) -> int:
         signed = float(distance_mm)
         if self.params.invert_direction:
             signed = -signed
         return units.ballscrew_mm_to_pulses(signed, **self._conv_kwargs())
 
+    def configure(self) -> None:
+        # Full config happens per-move (must be disabled first). Mark ready.
+        self._configured = True
+        logger.info("Ballscrew axis ready (slave %s)", self.params.slave_id)
+
+    def apply_motion_params(self, distance_mm: float | None = None) -> int:
+        dist = self.params.distance_mm if distance_mm is None else float(distance_mm)
+        return self._send_move_details(self._distance_pulses(dist), max(1, int(round(self.motor_speed_rpm))))
+
+    def _send_move_details(self, displacement: int, rpm: int) -> int:
+        """Proven handshake: disable, load relative multi-segment move, confirm."""
+        sid = self.params.slave_id
+        bus = self.bus
+        bus.write_u16(sid, C04_01, 0)
+        bus.write_u16(sid, C04_11, 0)
+        time.sleep(0.05)
+        bus.write_u16(sid, C00_00, 0)  # position
+        bus.write_u16(sid, C12_00, 0)  # speed profile off
+        bus.write_u16(sid, C03_00, 1)  # multi-segment
+        bus.write_u16(sid, C11_00, 0)  # single
+        bus.write_u16(sid, C11_01, 1)  # RELATIVE
+        bus.write_u16(sid, C11_03, 1)
+        bus.write_u16(sid, C11_04, 1)
+        bus.write_i32(sid, C11_06, displacement)  # low-word-first signed
+        bus.write_u16(sid, C11_08, rpm)
+        bus.write_u32(sid, C11_0A, int(round(self.params.acceleration_ms)))
+        bus.write_u32(sid, C11_0C, int(round(self.params.deceleration_ms)))
+        bus.write_u32(sid, C11_0E, 0)
+        bus.write_u16(sid, C04_00, DI1_PROFILE_TRIGGER)
+
+        time.sleep(0.02)
+        got_src = bus.read_u16(sid, C03_00)
+        got_rel = bus.read_u16(sid, C11_01)
+        got_fn = bus.read_u16(sid, C04_00)
+        got_delta = bus.read_i32(sid, C11_06)
+        got_rpm = bus.read_u16(sid, C11_08)
+        if got_src != 1 or got_rel != 1 or got_fn != DI1_PROFILE_TRIGGER:
+            raise RuntimeError(
+                f"drive reject config: C03.00={got_src} C11.01={got_rel} C04.00={got_fn}"
+            )
+        if got_delta != displacement:
+            raise RuntimeError(
+                f"drive C11.06 mismatch: wrote {displacement}, read {got_delta}"
+            )
+        if got_rpm != rpm:
+            raise RuntimeError(f"drive C11.08 mismatch: wrote {rpm}, read {got_rpm}")
+        logger.info("Ballscrew armed: delta=%s pulses rpm=%s", displacement, rpm)
+        return displacement
+
     def enable(self) -> None:
-        if not self._configured:
-            self.configure()
         self.bus.write_u16(self.params.slave_id, C04_11, 1)
         self.status.enabled = True
 
@@ -176,8 +179,6 @@ class BallscrewAxis:
         self.status.moving = False
 
     def home_here(self) -> None:
-        """Software zero only — does not command motion."""
-        # Make sure a leftover DI1 trigger cannot fire a move
         try:
             self.bus.write_u16(self.params.slave_id, C04_01, 0)
         except Exception:  # noqa: BLE001
@@ -185,10 +186,9 @@ class BallscrewAxis:
         self.poll()
         self._home_offset_pulses = self.status.encoder_pulses
         self.params.home_position_mm = 0.0
-        self._homed = True
         self.poll()
         logger.info(
-            "Home Here (no motion): offset_pulses=%s position_mm=%.3f",
+            "Home Here (no motion): offset=%s pos_mm=%.3f",
             self._home_offset_pulses,
             self.status.position_mm,
         )
@@ -205,85 +205,98 @@ class BallscrewAxis:
     def start_move(self, distance_mm: float | None = None) -> None:
         dist = self.params.distance_mm if distance_mm is None else float(distance_mm)
         if abs(dist) < 1e-9:
-            raise ValueError("Distance is 0 — nothing to move")
+            raise ValueError("Distance is 0")
         self.params.distance_mm = dist
         self._check_soft_limits(dist)
-        if not self._configured:
-            self.configure()
 
         sid = self.params.slave_id
-        # Clear any previous trigger before loading a new move
-        self.bus.write_u16(sid, C04_01, 0)
-        time.sleep(0.05)
-        self.apply_motion_params(dist)
+        pulses = self._distance_pulses(dist)
+        rpm = max(1, int(round(self.motor_speed_rpm)))
+        self._send_move_details(pulses, rpm)
 
+        # Enable, settle, then DI1 rising edge (held high during motion)
         self.bus.write_u16(sid, C04_11, 1)
         time.sleep(0.1)
-        # Rising edge on DI1 — hold high during motion (working ballscrew handshake)
+        if self.bus.read_u16(sid, C04_11) != 1:
+            raise RuntimeError("servo did not enable (C04.11 != 1)")
+        time.sleep(0.15)
         self.bus.write_u16(sid, C04_01, 0)
-        time.sleep(0.05)
+        time.sleep(0.08)
         self.bus.write_u16(sid, C04_01, 1)
         self.status.enabled = True
         self.status.moving = True
+        self._configured = True
 
     def wait_until_stopped(self, *, timeout_s: float, stop_event=None) -> None:
-        """Wait for position to settle (speed U40.01 is unreliable on this drive)."""
         sid = self.params.slave_id
-        deadline = time.monotonic() + timeout_s
-        time.sleep(0.2)
         start = self.bus.read_i32(sid, U40_16)
+        target_delta = self._distance_pulses(self.params.distance_mm)
+        target = start + target_delta
+        tol = max(4, abs(target_delta) // 200)
+        deadline = time.monotonic() + timeout_s
+        start_deadline = time.monotonic() + 3.0
+        moved = False
+        settled = 0
         last = start
-        stable = 0
-        saw_motion = False
         while time.monotonic() < deadline:
             if stop_event is not None and stop_event.is_set():
                 break
             pos = self.bus.read_i32(sid, U40_16)
-            delta = abs(pos - last)
-            if abs(pos - start) > 20:
-                saw_motion = True
-            if delta < 5:
-                stable += 1
-                if saw_motion and stable >= 6:
+            if abs(pos - start) > max(4, tol // 2):
+                moved = True
+            if abs(pos - target) <= tol:
+                settled += 1
+                if settled >= 4:
                     break
             else:
-                stable = 0
+                settled = 0
+            if not moved and time.monotonic() > start_deadline:
+                # retry one trigger edge
+                self.bus.write_u16(sid, C04_01, 0)
+                time.sleep(0.08)
+                self.bus.write_u16(sid, C04_01, 1)
+                start_deadline = time.monotonic() + 3.0
             last = pos
-            self.poll()
             time.sleep(0.05)
-        self.status.moving = False
         try:
             self.bus.write_u16(sid, C04_01, 0)
         except Exception:  # noqa: BLE001
             pass
+        self.status.moving = False
         self.poll()
+        logger.info(
+            "Ballscrew stop: start=%s last=%s target=%s moved=%s",
+            start,
+            last,
+            target,
+            moved,
+        )
+        if not moved:
+            raise RuntimeError(
+                f"ballscrew did not move (start={start} last={last} cmd_delta={target_delta})"
+            )
 
     def move_blocking(self, distance_mm: float | None = None, *, stop_event=None) -> None:
         dist = self.params.distance_mm if distance_mm is None else distance_mm
         self.start_move(dist)
-        timeout = max(5.0, self.estimated_duration_s() * 2.5 + 2.0)
+        timeout = max(8.0, self.estimated_duration_s() * 3.0 + 3.0)
         self.wait_until_stopped(timeout_s=timeout, stop_event=stop_event)
 
     def poll(self) -> BallscrewStatus:
         try:
             sid = self.params.slave_id
             enc = self.bus.read_i32(sid, U40_16)
-            try:
-                speed = self.bus.read_i16(sid, U40_01)
-            except Exception:  # noqa: BLE001
-                speed = 0
             self.status.encoder_pulses = enc
             rel = enc - self._home_offset_pulses
             mm = units.ballscrew_pulses_to_mm(rel, **self._conv_kwargs())
             if self.params.invert_direction:
                 mm = -mm
             self.status.position_mm = mm + self.params.home_position_mm
-            self.status.motor_rpm = float(speed)
-            self.status.axis_speed_mm_s = units.ballscrew_motor_rpm_to_axis_speed(
-                abs(self.status.motor_rpm),
-                pitch_mm=self.params.pitch_mm,
-                gear_ratio=self.params.gear_ratio,
-            )
+            try:
+                fault = self.bus.read_u16(sid, U41_01)
+                self.status.fault = "" if fault == 0 else f"Er.{fault}"
+            except Exception:  # noqa: BLE001
+                pass
             self.status.last_error = ""
         except Exception as exc:  # noqa: BLE001
             self.status.last_error = str(exc)
