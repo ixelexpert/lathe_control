@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import tkinter as tk
 from pathlib import Path
 from typing import Any
@@ -93,10 +94,6 @@ class LatheApp(ctk.CTk):
         ctk.CTkButton(top, text="Save Config", width=110, command=self._save_config).pack(
             side="left", padx=8
         )
-        ctk.CTkButton(top, text="Start Cycle", width=120, fg_color="#2e7d32", command=self._start_cycle).pack(
-            side="left", padx=6
-        )
-        ctk.CTkButton(top, text="Stop", width=90, command=self._stop_cycle).pack(side="left", padx=4)
         ctk.CTkButton(
             top,
             text="E-STOP",
@@ -111,8 +108,38 @@ class LatheApp(ctk.CTk):
             side="left", padx=12, fill="x", expand=True
         )
 
-        body = ctk.CTkFrame(self, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.tabs = ctk.CTkTabview(self)
+        self.tabs.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        tab_setup = self.tabs.add("Setup / Cycle")
+        tab_test = self.tabs.add("Axis Test")
+
+        self._build_setup_tab(tab_setup)
+        self._build_test_tab(tab_test)
+
+        note = (
+            "Directions: Ballscrew CW+ / CCW− · Chuck CCW+ / CW− · "
+            "Use Axis Test for independent jogging · "
+            "Chuck_Duration 0 on Setup = spin until ballscrew move completes."
+        )
+        ctk.CTkLabel(self, text=note, wraplength=1200, anchor="w").pack(
+            fill="x", padx=16, pady=(0, 10)
+        )
+
+        self._syncing = False
+        self._z_step_busy = False
+
+    def _build_setup_tab(self, parent: ctk.CTkFrame) -> None:
+        cycle_bar = ctk.CTkFrame(parent, fg_color="transparent")
+        cycle_bar.pack(fill="x", pady=(4, 8))
+        ctk.CTkButton(
+            cycle_bar, text="Start Cycle", width=120, fg_color="#2e7d32", command=self._start_cycle
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(cycle_bar, text="Stop Cycle", width=100, command=self._stop_cycle).pack(
+            side="left", padx=4
+        )
+
+        body = ctk.CTkFrame(parent, fg_color="transparent")
+        body.pack(fill="both", expand=True)
         body.grid_columnconfigure(0, weight=1)
         body.grid_columnconfigure(1, weight=1)
         body.grid_rowconfigure(0, weight=1)
@@ -181,16 +208,6 @@ class LatheApp(ctk.CTk):
             side="left", padx=4
         )
 
-        note = (
-            "Directions: Ballscrew CW+ / CCW− · Chuck CCW+ / CW− · "
-            "Chuck_Duration 0 = spin until ballscrew move completes · "
-            "Baud values must match on the shared RS485 bus."
-        )
-        ctk.CTkLabel(self, text=note, wraplength=1200, anchor="w").pack(
-            fill="x", padx=16, pady=(0, 10)
-        )
-
-        # Linked speed updates
         self.z_fields["axis_speed"].var.trace_add("write", lambda *_: self._on_z_axis_speed())
         self.z_fields["motor_speed"].var.trace_add("write", lambda *_: self._on_z_motor_speed())
         self.z_fields["distance"].var.trace_add("write", lambda *_: self._update_z_duration())
@@ -199,7 +216,77 @@ class LatheApp(ctk.CTk):
         self.c_fields["axis_speed"].var.trace_add("write", lambda *_: self._on_c_axis_speed())
         self.c_fields["motor_speed"].var.trace_add("write", lambda *_: self._on_c_motor_speed())
 
-        self._syncing = False
+    def _build_test_tab(self, parent: ctk.CTkFrame) -> None:
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_columnconfigure(1, weight=1)
+        parent.grid_rowconfigure(0, weight=1)
+
+        z_panel = ctk.CTkFrame(parent)
+        z_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=8)
+        c_panel = ctk.CTkFrame(parent)
+        c_panel.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=8)
+
+        ctk.CTkLabel(
+            z_panel, text="Ballscrew — independent step", font=ctk.CTkFont(size=18, weight="bold")
+        ).pack(anchor="w", padx=16, pady=(16, 8))
+
+        self.test_z_speed = ParamEntry(z_panel, "Step speed (mm/s)")
+        self.test_z_speed.pack(fill="x", padx=16, pady=6)
+        self.test_z_distance = ParamEntry(z_panel, "Step distance (mm)")
+        self.test_z_distance.pack(fill="x", padx=16, pady=6)
+        self.test_z_position = ParamEntry(z_panel, "Position (mm)", readonly=True)
+        self.test_z_position.pack(fill="x", padx=16, pady=6)
+        self.test_z_live_speed = ParamEntry(z_panel, "Live speed (mm/s)", readonly=True)
+        self.test_z_live_speed.pack(fill="x", padx=16, pady=6)
+
+        z_btns = ctk.CTkFrame(z_panel, fg_color="transparent")
+        z_btns.pack(fill="x", padx=16, pady=16)
+        ctk.CTkButton(
+            z_btns, text="Step − (CCW)", width=140, command=lambda: self._test_step_z(-1)
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            z_btns, text="Step + (CW)", width=140, fg_color="#2e7d32", command=lambda: self._test_step_z(1)
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(z_btns, text="Stop Z", width=100, command=self._test_stop_z).pack(
+            side="left", padx=4
+        )
+        ctk.CTkButton(z_btns, text="Home Here", width=110, command=self._home_here).pack(
+            side="left", padx=4
+        )
+
+        ctk.CTkLabel(
+            z_panel,
+            text="Step + moves CW (positive). Step − moves CCW (negative).\n"
+            "Distance is always the absolute step size.",
+            justify="left",
+        ).pack(anchor="w", padx=16, pady=(0, 16))
+
+        ctk.CTkLabel(
+            c_panel, text="Chuck — independent on/off", font=ctk.CTkFont(size=18, weight="bold")
+        ).pack(anchor="w", padx=16, pady=(16, 8))
+
+        self.test_c_speed = ParamEntry(c_panel, "Chuck speed (rpm)")
+        self.test_c_speed.pack(fill="x", padx=16, pady=6)
+        self.test_c_live = ParamEntry(c_panel, "Live chuck speed (rpm)", readonly=True)
+        self.test_c_live.pack(fill="x", padx=16, pady=6)
+        self.test_c_state = ParamEntry(c_panel, "Chuck state", readonly=True)
+        self.test_c_state.pack(fill="x", padx=16, pady=6)
+        self.test_c_state.set("Off")
+
+        c_btns = ctk.CTkFrame(c_panel, fg_color="transparent")
+        c_btns.pack(fill="x", padx=16, pady=16)
+        ctk.CTkButton(
+            c_btns, text="Chuck ON", width=140, fg_color="#2e7d32", command=self._test_chuck_on
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            c_btns, text="Chuck OFF", width=140, fg_color="#c62828", command=self._test_chuck_off
+        ).pack(side="left", padx=4)
+
+        ctk.CTkLabel(
+            c_panel,
+            text="Chuck runs independently of ballscrew.\nPositive rpm = CCW.",
+            justify="left",
+        ).pack(anchor="w", padx=16, pady=(0, 16))
 
     def _load_fields_from_config(self) -> None:
         bp = ballscrew_params_from_config(self.cfg)
@@ -239,6 +326,14 @@ class LatheApp(ctk.CTk):
             self.c_fields["gear"].set(cp.gear_ratio)
             self.c_fields["start_delay"].set(cp.start_delay_s)
             self.c_fields["end_delay"].set(cp.end_delay_s)
+
+            self.test_z_speed.set(min(20.0, abs(bp.axis_speed_mm_s) or 20.0))
+            self.test_z_distance.set(10.0)
+            self.test_z_position.set(0.0)
+            self.test_z_live_speed.set(0.0)
+            self.test_c_speed.set(min(60.0, abs(cp.axis_speed_rpm) or 60.0))
+            self.test_c_live.set(0.0)
+            self.test_c_state.set("Off")
         finally:
             self._syncing = False
 
@@ -481,9 +576,88 @@ class LatheApp(ctk.CTk):
             self.ballscrew.home_here()
             self.z_fields["home"].set(self.ballscrew.params.home_position_mm)
             self.z_fields["position"].set(self.ballscrew.status.position_mm)
+            self.test_z_position.set(self.ballscrew.status.position_mm)
             self.status_var.set("Home Here set")
         except Exception as exc:  # noqa: BLE001
             self.status_var.set(f"Home Here failed: {exc}")
+
+    def _require_connected(self) -> bool:
+        if not self.bus or not self.bus.connected or not self.ballscrew or not self.chuck:
+            self.status_var.set("Connect first")
+            return False
+        if self.cycle and self.cycle.busy:
+            self.status_var.set("Stop the cycle before using Axis Test")
+            return False
+        return True
+
+    def _test_step_z(self, direction: int) -> None:
+        if not self._require_connected():
+            return
+        if self._z_step_busy:
+            self.status_var.set("Ballscrew step already running")
+            return
+        try:
+            speed = abs(self.test_z_speed.get_float())
+            distance = abs(self.test_z_distance.get_float())
+            if distance <= 0:
+                raise ValueError("Step distance must be > 0")
+            if speed <= 0:
+                raise ValueError("Step speed must be > 0")
+            signed = distance if direction >= 0 else -distance
+        except Exception as exc:  # noqa: BLE001
+            self.status_var.set(f"Step settings error: {exc}")
+            return
+
+        self._z_step_busy = True
+        self.status_var.set(f"Stepping ballscrew {signed:+.3f} mm @ {speed:.3f} mm/s")
+
+        def worker() -> None:
+            try:
+                assert self.ballscrew is not None
+                # Keep setup-tab accel/pitch/limits; override speed for this step only
+                self.ballscrew.params.axis_speed_mm_s = speed
+                self.ballscrew.move_blocking(signed)
+                self.after(0, lambda: self.status_var.set(f"Ballscrew step done ({signed:+.3f} mm)"))
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Ballscrew step failed")
+                self.after(0, lambda: self.status_var.set(f"Ballscrew step failed: {exc}"))
+            finally:
+                self._z_step_busy = False
+
+        threading.Thread(target=worker, name="Z-Step", daemon=True).start()
+
+    def _test_stop_z(self) -> None:
+        if not self.ballscrew:
+            return
+        try:
+            self.ballscrew.disable()
+            self._z_step_busy = False
+            self.status_var.set("Ballscrew stopped")
+        except Exception as exc:  # noqa: BLE001
+            self.status_var.set(f"Ballscrew stop failed: {exc}")
+
+    def _test_chuck_on(self) -> None:
+        if not self._require_connected():
+            return
+        try:
+            rpm = self.test_c_speed.get_float()
+            self.chuck.set_axis_speed(rpm)
+            self.chuck.start()
+            self.test_c_state.set("On")
+            self.status_var.set(f"Chuck ON @ {rpm:.2f} rpm")
+        except Exception as exc:  # noqa: BLE001
+            self.status_var.set(f"Chuck ON failed: {exc}")
+
+    def _test_chuck_off(self) -> None:
+        if not self.chuck:
+            self.status_var.set("Connect first")
+            return
+        try:
+            self.chuck.stop()
+            self.test_c_state.set("Off")
+            self.status_var.set("Chuck OFF")
+        except Exception as exc:  # noqa: BLE001
+            self.status_var.set(f"Chuck OFF failed: {exc}")
 
     def _on_cycle_state(self, state: CycleState, message: str) -> None:
         self.after(0, lambda: self.status_var.set(f"{state.value}: {message}"))
@@ -498,10 +672,13 @@ class LatheApp(ctk.CTk):
                 self.z_fields["live_motor_speed"].set(zs.motor_rpm)
                 self.c_fields["live_axis_speed"].set(cs.axis_rpm)
                 self.c_fields["live_motor_speed"].set(cs.motor_rpm)
-                err = zs.last_error or cs.last_error
-                if err and not (self.cycle and self.cycle.busy):
-                    # keep soft — don't spam over cycle messages
-                    pass
+                self.test_z_position.set(zs.position_mm)
+                self.test_z_live_speed.set(zs.axis_speed_mm_s)
+                self.test_c_live.set(cs.axis_rpm)
+                if cs.spinning or cs.enabled:
+                    self.test_c_state.set("On")
+                else:
+                    self.test_c_state.set("Off")
         except Exception:  # noqa: BLE001
             logger.debug("poll tick error", exc_info=True)
         self.after(200, self._poll_tick)
