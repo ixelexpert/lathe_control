@@ -114,6 +114,10 @@ class BallscrewAxis:
             signed = -signed
         return units.ballscrew_mm_to_pulses(signed, **self._conv_kwargs())
 
+    def configure(self) -> None:
+        """Bring the ballscrew drive into a known position-mode state (no motion)."""
+        self.write_cycle_params()
+
     def write_cycle_params(self) -> None:
         """Write mode + motion params to the ballscrew drive without enabling or triggering.
 

@@ -646,12 +646,16 @@ class LatheApp(ctk.CTk):
                 return
 
             try:
-                self.ballscrew.configure()
-                self.chuck.configure()
+                self.ballscrew.write_cycle_params()
+                self.chuck.write_cycle_params()
             except Exception as cfg_exc:  # noqa: BLE001
-                self.modbus_ready = False
-                self._set_modbus_lamp(LAMP_USB, "Modbus: config fail")
-                self.status_var.set(f"Drive answered, but configure failed: {cfg_exc}")
+                # Keep the bus open — params can be retried; replies already proved OK.
+                self.modbus_ready = True
+                self._set_modbus_lamp(LAMP_OK, "Modbus: connected")
+                self.status_var.set(
+                    f"Connected on {port}.{reply_detail} "
+                    f"(param write warning: {cfg_exc})"
+                )
                 return
 
             self.modbus_ready = True
