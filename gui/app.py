@@ -70,6 +70,7 @@ class LatheApp(ctk.CTk):
         self.ballscrew: BallscrewAxis | None = None
         self.chuck: ChuckAxis | None = None
         self.cycle: CycleEngine | None = None
+        self.modbus_ready = False  # True only after a drive answers Modbus
 
         self._build_ui()
         self._load_fields_from_config()
@@ -482,26 +483,42 @@ class LatheApp(ctk.CTk):
             self.bus.connect()
             self.ballscrew = BallscrewAxis(self.bus, bp)
             self.chuck = ChuckAxis(self.bus, cp)
+            self.cycle = CycleEngine(self.ballscrew, self.chuck)
+            self.cycle.on_state = self._on_cycle_state
+
+            # Prove at least one drive answers before calling this "connected"
+            reply_ok = False
+            reply_detail = ""
+            for sid in (bp.slave_id, cp.slave_id):
+                try:
+                    mode = self.bus.read_u16(sid, 0x0000)
+                    reply_ok = True
+                    reply_detail += f" slave{sid} C00.00={mode}"
+                except Exception as exc:  # noqa: BLE001
+                    reply_detail += f" slave{sid}:no-reply({exc})"
+
+            self.btn_connect.configure(state="disabled")
+            self.btn_disconnect.configure(state="normal")
+
+            if not reply_ok:
+                self.modbus_ready = False
+                self.status_var.set(
+                    f"Serial open on {port}, but NO Modbus reply from drives.{reply_detail}. "
+                    "Motion disabled until RS485 works — check AC power, CN3 485+/485-/GND, "
+                    "swap A/B if needed, baud C0A.01, station C0A.00."
+                )
+                return
+
             try:
                 self.ballscrew.configure()
                 self.chuck.configure()
             except Exception as cfg_exc:  # noqa: BLE001
-                # Serial port is open, but drives did not answer — keep connection
-                # so the user can retry Apply / diagnose wiring.
-                self.status_var.set(
-                    f"Serial OK on {port}, but drive Modbus did not reply: {cfg_exc}. "
-                    "Check AC power, CN3 485+/485-/GND wiring, baud, and slave IDs."
-                )
-                self.btn_connect.configure(state="disabled")
-                self.btn_disconnect.configure(state="normal")
-                self.cycle = CycleEngine(self.ballscrew, self.chuck)
-                self.cycle.on_state = self._on_cycle_state
+                self.modbus_ready = False
+                self.status_var.set(f"Drive answered, but configure failed: {cfg_exc}")
                 return
-            self.cycle = CycleEngine(self.ballscrew, self.chuck)
-            self.cycle.on_state = self._on_cycle_state
-            self.btn_connect.configure(state="disabled")
-            self.btn_disconnect.configure(state="normal")
-            self.status_var.set(f"Connected on {port}")
+
+            self.modbus_ready = True
+            self.status_var.set(f"Connected on {port}.{reply_detail}")
         except Exception as exc:  # noqa: BLE001
             logger.exception("Connect failed")
             self.status_var.set(f"Connect failed: {exc}")
@@ -525,6 +542,7 @@ class LatheApp(ctk.CTk):
         self.ballscrew = None
         self.chuck = None
         self.cycle = None
+        self.modbus_ready = False
         self.btn_connect.configure(state="normal")
         self.btn_disconnect.configure(state="disabled")
         self.status_var.set("Disconnected")
@@ -539,8 +557,8 @@ class LatheApp(ctk.CTk):
             self.status_var.set(f"Save failed: {exc}")
 
     def _start_cycle(self) -> None:
-        if not self.cycle or not self.bus or not self.bus.connected:
-            self.status_var.set("Connect before starting a cycle")
+        if not self.modbus_ready or not self.cycle or not self.bus or not self.bus.connected:
+            self.status_var.set("Modbus not ready — fix drive RS485 connection before Start Cycle")
             return
         try:
             bp, cp = self._read_gui_into_params()
@@ -584,6 +602,12 @@ class LatheApp(ctk.CTk):
     def _require_connected(self) -> bool:
         if not self.bus or not self.bus.connected or not self.ballscrew or not self.chuck:
             self.status_var.set("Connect first")
+            return False
+        if not self.modbus_ready:
+            self.status_var.set(
+                "Modbus not ready — drives are not answering. "
+                "Check RS485 wiring/power; Step/Chuck will not move until a drive replies."
+            )
             return False
         if self.cycle and self.cycle.busy:
             self.status_var.set("Stop the cycle before using Axis Test")
