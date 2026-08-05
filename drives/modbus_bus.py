@@ -123,24 +123,22 @@ class ModbusBus:
             )
             time.sleep(self.inter_frame_s)
 
-    def write_u32(self, slave: int, address: int, value: int, *, high_first: bool = True) -> None:
+    def write_u32(self, slave: int, address: int, value: int, *, high_first: bool = False) -> None:
+        """Write 32-bit value as two registers.
+
+        A6-RS vendor examples and the working /home/pi/ballscrew stack use
+        **low word first** (C0A.06 style used on this rig).
+        """
         value = int(value) & 0xFFFFFFFF
-        high = (value >> 16) & 0xFFFF
         low = value & 0xFFFF
-        # Match working /home/pi/ballscrew encoding: small values as (value, 0)
-        if high_first:
-            if value <= 0xFFFF:
-                regs = [value & 0xFFFF, 0]
-            else:
-                regs = [high, low]
-        else:
-            regs = [low, high]
+        high = (value >> 16) & 0xFFFF
+        regs = [high, low] if high_first else [low, high]
         with self._lock:
             instrument = self._select(slave)
             instrument.write_registers(int(address), regs)
             time.sleep(self.inter_frame_s)
 
-    def write_i32(self, slave: int, address: int, value: int, *, high_first: bool = True) -> None:
+    def write_i32(self, slave: int, address: int, value: int, *, high_first: bool = False) -> None:
         value = int(value)
         if value < 0:
             value = (1 << 32) + value
@@ -168,22 +166,18 @@ class ModbusBus:
             time.sleep(self.inter_frame_s)
             return val
 
-    def read_u32(self, slave: int, address: int, *, high_first: bool = True) -> int:
+    def read_u32(self, slave: int, address: int, *, high_first: bool = False) -> int:
         with self._lock:
             instrument = self._select(slave)
             regs = instrument.read_registers(int(address), 2, functioncode=3)
             time.sleep(self.inter_frame_s)
             a, b = int(regs[0]), int(regs[1])
             if high_first:
-                # Match working ballscrew decode for A6 word packing
-                if a == 0:
-                    return b
-                if b == 0:
-                    return a
                 return ((a & 0xFFFF) << 16) | (b & 0xFFFF)
-            return ((b & 0xFFFF) << 16) | (a & 0xFFFF)
+            # low word first (working ballscrew default)
+            return (a & 0xFFFF) | ((b & 0xFFFF) << 16)
 
-    def read_i32(self, slave: int, address: int, *, high_first: bool = True) -> int:
+    def read_i32(self, slave: int, address: int, *, high_first: bool = False) -> int:
         raw = self.read_u32(slave, address, high_first=high_first)
         return raw - 0x100000000 if raw >= 0x80000000 else raw
 

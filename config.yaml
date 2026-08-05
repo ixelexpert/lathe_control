@@ -6,14 +6,14 @@ ballscrew:
   slave_id: 1
   baud: 115200
   gear_ratio: 1.0          # motor revolutions per load revolution
-  pitch_mm: 10.0           # mm per ballscrew revolution
+  pitch_mm: 5.0            # SFU1605 lead (mm/rev) — matches working ballscrew app
   pulses_per_rev: 10000    # C00.02 default
   axis_speed_mm_s: 20.0    # keep low for first tests (max 200)
   acceleration_ms: 200
   deceleration_ms: 200
   distance_mm: 50.0
   home_position_mm: 0.0
-  soft_min_mm: 0.0
+  soft_min_mm: -500.0      # allow jog both ways after Home Here
   soft_max_mm: 500.0
   start_delay_s: 0.0
   end_delay_s: 0.0
