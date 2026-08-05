@@ -782,10 +782,33 @@ class LatheApp(ctk.CTk):
         def worker() -> None:
             try:
                 assert self.ballscrew is not None
-                # Keep setup-tab accel/pitch/limits; override speed for this step only
+                # Sync kinematics from Setup tab so Pitch=5 is honored
+                try:
+                    self.ballscrew.params.pitch_mm = self.z_fields["pitch"].get_float()
+                    self.ballscrew.params.gear_ratio = self.z_fields["gear"].get_float()
+                    self.ballscrew.params.acceleration_ms = self.z_fields["accel"].get_float()
+                    self.ballscrew.params.deceleration_ms = self.z_fields["decel"].get_float()
+                except ValueError:
+                    pass
                 self.ballscrew.params.axis_speed_mm_s = speed
+                self.ballscrew.params.soft_min_mm = -500.0
+                self.ballscrew.params.soft_max_mm = 500.0
+                pulses = self.ballscrew._distance_pulses(signed)
+                self.after(
+                    0,
+                    lambda: self.status_var.set(
+                        f"Stepping {signed:+.3f} mm ({pulses} pulses) @ {speed:.3f} mm/s"
+                    ),
+                )
                 self.ballscrew.move_blocking(signed)
-                self.after(0, lambda: self.status_var.set(f"Ballscrew step done ({signed:+.3f} mm)"))
+                self.ballscrew.poll()
+                pos = self.ballscrew.status.position_mm
+                self.after(
+                    0,
+                    lambda: self.status_var.set(
+                        f"Ballscrew step done ({signed:+.3f} mm) now at {pos:.3f} mm"
+                    ),
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Ballscrew step failed")
                 self.after(0, lambda: self.status_var.set(f"Ballscrew step failed: {exc}"))
@@ -833,6 +856,9 @@ class LatheApp(ctk.CTk):
     def _poll_tick(self) -> None:
         try:
             if self.bus and self.bus.connected and self.ballscrew and self.chuck:
+                if not self.bus.polling_allowed or self._z_step_busy or (self.cycle and self.cycle.busy):
+                    self.after(200, self._poll_tick)
+                    return
                 zs = self.ballscrew.poll()
                 cs = self.chuck.poll()
                 self.z_fields["position"].set(zs.position_mm)

@@ -50,6 +50,20 @@ class ModbusBus:
         self._ser: serial.Serial | None = None
         self._lock = threading.RLock()
         self._connected = False
+        # When >0, status polling should not touch the bus (move sequences own it).
+        self.motion_gate = threading.Event()
+        self.motion_gate.set()  # set = polling allowed
+
+    def begin_motion(self) -> None:
+        """Block status polling for an exclusive move sequence."""
+        self.motion_gate.clear()
+
+    def end_motion(self) -> None:
+        self.motion_gate.set()
+
+    @property
+    def polling_allowed(self) -> bool:
+        return self.motion_gate.is_set()
 
     @property
     def connected(self) -> bool:

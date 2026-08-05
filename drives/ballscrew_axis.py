@@ -251,11 +251,12 @@ class BallscrewAxis:
             else:
                 settled = 0
             if not moved and time.monotonic() > start_deadline:
-                # retry one trigger edge
-                self.bus.write_u16(sid, C04_01, 0)
-                time.sleep(0.08)
-                self.bus.write_u16(sid, C04_01, 1)
-                start_deadline = time.monotonic() + 3.0
+                # Only re-edge if we truly never left the start window
+                if abs(last - start) <= max(4, tol // 2):
+                    self.bus.write_u16(sid, C04_01, 0)
+                    time.sleep(0.08)
+                    self.bus.write_u16(sid, C04_01, 1)
+                start_deadline = time.monotonic() + 4.0
             last = pos
             time.sleep(0.05)
         try:
@@ -278,9 +279,13 @@ class BallscrewAxis:
 
     def move_blocking(self, distance_mm: float | None = None, *, stop_event=None) -> None:
         dist = self.params.distance_mm if distance_mm is None else distance_mm
-        self.start_move(dist)
-        timeout = max(8.0, self.estimated_duration_s() * 3.0 + 3.0)
-        self.wait_until_stopped(timeout_s=timeout, stop_event=stop_event)
+        self.bus.begin_motion()
+        try:
+            self.start_move(dist)
+            timeout = max(15.0, self.estimated_duration_s() * 3.0 + 5.0)
+            self.wait_until_stopped(timeout_s=timeout, stop_event=stop_event)
+        finally:
+            self.bus.end_motion()
 
     def poll(self) -> BallscrewStatus:
         try:
