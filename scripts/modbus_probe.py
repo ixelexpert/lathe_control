@@ -1,59 +1,44 @@
 #!/usr/bin/env python3
-"""Probe A6-RS Modbus connectivity."""
+"""Probe A6-RS Modbus with minimalmodbus."""
 
 from __future__ import annotations
 
-from pymodbus.client import ModbusSerialClient
-from pymodbus.exceptions import ModbusException
+import minimalmodbus
+import serial
+from config_io import detect_serial_port
 
-PORT = "/dev/ttyACM3"
 
-
-def try_read(client: ModbusSerialClient, slave: int, addr: int, count: int = 1):
+def probe(port: str, baud: int, slave: int) -> int | None:
     try:
-        r = client.read_holding_registers(addr, count=count, device_id=slave)
-        if r is not None and not r.isError():
-            return r.registers
-    except ModbusException:
+        inst = minimalmodbus.Instrument(port, slave, mode=minimalmodbus.MODE_RTU)
+        inst.serial.baudrate = baud
+        inst.serial.bytesize = 8
+        inst.serial.parity = serial.PARITY_NONE
+        inst.serial.stopbits = 1
+        inst.serial.timeout = 0.5
+        inst.clear_buffers_before_each_transaction = True
+        inst.close_port_after_each_call = True
+        return int(inst.read_register(0x0000, 0, 3, False))
+    except Exception as exc:  # noqa: BLE001
+        print(f"  slave={slave} baud={baud} fail: {exc}")
         return None
-    return None
 
 
 def main() -> None:
-    for baud in (115200, 9600, 38400, 19200, 57600):
-        client = ModbusSerialClient(
-            port=PORT,
-            baudrate=baud,
-            parity="N",
-            stopbits=1,
-            bytesize=8,
-            timeout=0.5,
-            retries=0,
-        )
-        ok = client.connect()
-        print(f"=== baud={baud} connect={ok}")
-        if not ok:
-            continue
+    port = detect_serial_port() or "/dev/ttyACM0"
+    print(f"Port: {port}")
+    for baud in (115200, 9600, 38400, 19200):
+        print(f"=== baud={baud}")
         hits = []
-        for slave in range(1, 8):
-            regs = try_read(client, slave, 0x0000)
-            if regs is None:
-                print(f"  slave={slave} no reply")
-                continue
-            hits.append(slave)
-            print(f"  HIT slave={slave} C00.00={regs}")
-            for addr, count in ((0x0A00, 1), (0x0A01, 1), (0x0411, 1), (0x4001, 2)):
-                print(f"    {addr:#06x} -> {try_read(client, slave, addr, count)}")
-        client.close()
+        for slave in range(1, 5):
+            val = probe(port, baud, slave)
+            if val is not None:
+                print(f"  HIT slave={slave} C00.00={val}")
+                hits.append(slave)
         if hits:
-            print("Drives are answering Modbus.")
+            print("minimalmodbus OK")
             return
-    print(
-        "NO DRIVE REPLIES.\n"
-        "Serial adapter opened, but RS485 Modbus is not reaching an A6-RS drive.\n"
-        "Check: drive AC power, CN3 pins 4/5/8 (485+/485-/GND), A/B polarity, "
-        "baud C0A.01, station C0A.00."
-    )
+    print("NO DRIVE REPLIES with minimalmodbus")
 
 
 if __name__ == "__main__":
