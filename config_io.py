@@ -12,6 +12,54 @@ from drives.chuck_axis import ChuckParams
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "config.yaml"
 
+# Prefer this USB-RS485 adapter when present (QinHeng CH343/CH910 "USB Single Serial").
+PREFERRED_SERIAL_SUBSTRINGS = (
+    "usb-1a86_USB_Single_Serial",
+    "1a86_USB_Single_Serial",
+)
+
+
+def detect_serial_port() -> str | None:
+    """Return the best available serial device path, preferring the known RS485 adapter."""
+    by_id = Path("/dev/serial/by-id")
+    if by_id.is_dir():
+        entries = sorted(p for p in by_id.iterdir() if p.is_symlink() or p.exists())
+        for needle in PREFERRED_SERIAL_SUBSTRINGS:
+            for entry in entries:
+                if needle in entry.name:
+                    return str(entry)
+        if entries:
+            for entry in entries:
+                if "arduino" not in entry.name.lower():
+                    return str(entry)
+            return str(entries[0])
+
+    matches = sorted(Path("/dev").glob("ttyACM*")) + sorted(Path("/dev").glob("ttyUSB*"))
+    if matches:
+        return str(matches[0])
+    return None
+
+
+def resolve_serial_port(configured: str | None) -> tuple[str, str]:
+    """Pick serial port for startup.
+
+    Returns (port_path, note). Prefers live detection of the QinHeng adapter;
+    falls back to configured path.
+    """
+    detected = detect_serial_port()
+    configured = (configured or "").strip()
+    if detected:
+        note = f"Detected {detected}"
+        if configured and configured != detected:
+            # If configured by-id still exists, keep it (stable); else use detected
+            if Path(configured).exists():
+                return configured, f"Using configured port {configured} (also detected {detected})"
+            return detected, f"Configured port missing; using detected {detected}"
+        return detected, note
+    if configured:
+        return configured, f"Using configured port {configured} (no adapter auto-detected)"
+    return "/dev/ttyACM0", "No serial adapter detected; defaulting to /dev/ttyACM0"
+
 
 def load_config(path: Path | str | None = None) -> dict[str, Any]:
     cfg_path = Path(path) if path else DEFAULT_CONFIG

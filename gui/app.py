@@ -15,6 +15,7 @@ from config_io import (
     ballscrew_params_from_config,
     chuck_params_from_config,
     load_config,
+    resolve_serial_port,
     save_config,
 )
 from cycle.engine import CycleEngine, CycleState
@@ -82,8 +83,13 @@ class LatheApp(ctk.CTk):
         top.pack(fill="x", padx=12, pady=10)
 
         ctk.CTkLabel(top, text="Serial port").pack(side="left", padx=(8, 4))
-        self.port_var = tk.StringVar(value=str(self.cfg.get("serial_port", "/dev/ttyUSB0")))
-        ctk.CTkEntry(top, textvariable=self.port_var, width=140).pack(side="left")
+        configured_port = str(self.cfg.get("serial_port", ""))
+        resolved_port, port_note = resolve_serial_port(configured_port)
+        self.port_var = tk.StringVar(value=resolved_port)
+        ctk.CTkEntry(top, textvariable=self.port_var, width=280).pack(side="left")
+        ctk.CTkButton(top, text="Rescan", width=70, command=self._rescan_serial).pack(
+            side="left", padx=4
+        )
 
         self.btn_connect = ctk.CTkButton(top, text="Connect", width=100, command=self._connect)
         self.btn_connect.pack(side="left", padx=6)
@@ -104,7 +110,7 @@ class LatheApp(ctk.CTk):
             command=self._estop,
         ).pack(side="left", padx=10)
 
-        self.status_var = tk.StringVar(value="Disconnected")
+        self.status_var = tk.StringVar(value=port_note)
         ctk.CTkLabel(top, textvariable=self.status_var, anchor="w").pack(
             side="left", padx=12, fill="x", expand=True
         )
@@ -128,6 +134,16 @@ class LatheApp(ctk.CTk):
 
         self._syncing = False
         self._z_step_busy = False
+
+    def _rescan_serial(self) -> None:
+        port, note = resolve_serial_port(self.port_var.get().strip())
+        self.port_var.set(port)
+        # Show resolved target as well as by-id -> tty mapping when possible
+        try:
+            target = Path(port).resolve()
+            self.status_var.set(f"{note} → {target}")
+        except Exception:  # noqa: BLE001
+            self.status_var.set(note)
 
     def _build_setup_tab(self, parent: ctk.CTkFrame) -> None:
         cycle_bar = ctk.CTkFrame(parent, fg_color="transparent")
