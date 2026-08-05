@@ -1,6 +1,6 @@
 # Lathe control defaults for Raspberry Pi 400 + A6-400RS (Modbus RTU)
-serial_port: /dev/ttyUSB0
-# On Windows testing you may use COM3 etc.
+serial_port: /dev/serial/by-id/usb-1a86_USB_Single_Serial_5ACB091143-if00
+# Stable path for QinHeng USB RS485 adapter on the Pi (also /dev/ttyACM3)
 
 ballscrew:
   slave_id: 1

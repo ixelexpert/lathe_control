@@ -387,8 +387,21 @@ class LatheApp(ctk.CTk):
             self.bus.connect()
             self.ballscrew = BallscrewAxis(self.bus, bp)
             self.chuck = ChuckAxis(self.bus, cp)
-            self.ballscrew.configure()
-            self.chuck.configure()
+            try:
+                self.ballscrew.configure()
+                self.chuck.configure()
+            except Exception as cfg_exc:  # noqa: BLE001
+                # Serial port is open, but drives did not answer — keep connection
+                # so the user can retry Apply / diagnose wiring.
+                self.status_var.set(
+                    f"Serial OK on {port}, but drive Modbus did not reply: {cfg_exc}. "
+                    "Check AC power, CN3 485+/485-/GND wiring, baud, and slave IDs."
+                )
+                self.btn_connect.configure(state="disabled")
+                self.btn_disconnect.configure(state="normal")
+                self.cycle = CycleEngine(self.ballscrew, self.chuck)
+                self.cycle.on_state = self._on_cycle_state
+                return
             self.cycle = CycleEngine(self.ballscrew, self.chuck)
             self.cycle.on_state = self._on_cycle_state
             self.btn_connect.configure(state="disabled")
