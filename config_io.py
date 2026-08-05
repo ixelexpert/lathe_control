@@ -19,20 +19,32 @@ PREFERRED_SERIAL_SUBSTRINGS = (
 )
 
 
+def _to_tty_path(path: Path) -> str:
+    """Resolve symlinks to the real /dev/ttyACM* or /dev/ttyUSB* node."""
+    try:
+        real = path.resolve()
+        name = real.name
+        if name.startswith("ttyACM") or name.startswith("ttyUSB"):
+            return str(real)
+    except Exception:  # noqa: BLE001
+        pass
+    return str(path)
+
+
 def detect_serial_port() -> str | None:
-    """Return the best available serial device path, preferring the known RS485 adapter."""
+    """Return the live ttyACM/ttyUSB path for the QinHeng RS485 adapter when present."""
     by_id = Path("/dev/serial/by-id")
     if by_id.is_dir():
         entries = sorted(p for p in by_id.iterdir() if p.is_symlink() or p.exists())
         for needle in PREFERRED_SERIAL_SUBSTRINGS:
             for entry in entries:
                 if needle in entry.name:
-                    return str(entry)
+                    return _to_tty_path(entry)
         if entries:
             for entry in entries:
                 if "arduino" not in entry.name.lower():
-                    return str(entry)
-            return str(entries[0])
+                    return _to_tty_path(entry)
+            return _to_tty_path(entries[0])
 
     matches = sorted(Path("/dev").glob("ttyACM*")) + sorted(Path("/dev").glob("ttyUSB*"))
     if matches:
@@ -41,24 +53,23 @@ def detect_serial_port() -> str | None:
 
 
 def resolve_serial_port(configured: str | None) -> tuple[str, str]:
-    """Pick serial port for startup.
-
-    Always prefers a live-detected QinHeng / non-Arduino adapter when present.
-    Returns (port_path, note).
-    """
+    """Pick serial port for startup as a concrete /dev/ttyACM* (or ttyUSB*) path."""
     detected = detect_serial_port()
-    configured = (configured or "").strip()
     if detected:
-        try:
-            target = Path(detected).resolve()
-            note = f"USB assigned: {detected} → {target}"
-        except Exception:  # noqa: BLE001
-            note = f"USB assigned: {detected}"
-        return detected, note
-    if configured and Path(configured).exists():
-        return configured, f"Using configured port {configured}"
+        return detected, f"USB assigned at startup: {detected}"
+
+    configured = (configured or "").strip()
     if configured:
+        cfg_path = Path(configured)
+        if cfg_path.exists() or cfg_path.is_symlink():
+            tty = _to_tty_path(cfg_path)
+            return tty, f"Using configured port resolved to {tty}"
         return configured, f"Configured port not present: {configured}"
+
+    # Last resort: first ACM device on the system
+    acms = sorted(Path("/dev").glob("ttyACM*"))
+    if acms:
+        return str(acms[0]), f"Fallback ACM device: {acms[0]}"
     return "/dev/ttyACM0", "No serial adapter detected; defaulting to /dev/ttyACM0"
 
 
